@@ -1,0 +1,12 @@
+# Brief (kept out of the repo)
+react-native-technical-test-field-reports*.html
+
+node_modules/
+dist/
+coverage/
+*.log
+.DS_Store
+.env
+
+# server runtime data
+server/data/
