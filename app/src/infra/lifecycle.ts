@@ -1,6 +1,8 @@
 import NetInfo from '@react-native-community/netinfo';
 import { AppState } from 'react-native';
+import { startBackgroundWork } from './background';
 import { outbox } from './outbox';
+import { finishInterruptedReset } from './reset';
 
 /**
  * Start the uploader and give it every useful wake-up signal. Connectivity is
@@ -9,7 +11,10 @@ import { outbox } from './outbox';
  */
 export function startOutboxLifecycle(): () => void {
   const box = outbox();
-  box.start().catch(e => console.error('[outbox] failed to start', e));
+  finishInterruptedReset()
+    .then(() => box.start())
+    .catch(e => console.error('[outbox] failed to start', e));
+  const stopBackground = startBackgroundWork();
 
   const unsubscribeNet = NetInfo.addEventListener(state => {
     box.connectivityChanged(state.isConnected === true && state.isInternetReachable !== false);
@@ -21,5 +26,6 @@ export function startOutboxLifecycle(): () => void {
   return () => {
     unsubscribeNet();
     appState.remove();
+    stopBackground();
   };
 }

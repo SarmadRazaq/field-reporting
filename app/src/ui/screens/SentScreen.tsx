@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { FlatList, Image, Pressable, RefreshControl, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { clockTime, duration } from '../../core/status';
@@ -6,7 +7,7 @@ import { Button } from '../components/Button';
 import { Icon } from '../components/Icon';
 import { Notice } from '../components/Notice';
 import { useNow } from '../hooks/useNow';
-import { useServerReports } from '../hooks/useServerReports';
+import { useServerReports, useUploadsWaiting } from '../hooks/useServerReports';
 import type { TabScreenProps } from '../navigation/types';
 import { color, radius, space, type } from '../theme';
 
@@ -15,6 +16,9 @@ export function SentScreen({ navigation }: TabScreenProps<'Sent'>) {
   const insets = useSafeAreaInsets();
   const now = useNow(15_000);
   const query = useServerReports();
+  const waiting = useUploadsWaiting();
+  const [photosAnyway, setPhotosAnyway] = useState(false);
+  const showThumbs = !waiting || photosAnyway;
   const reports = query.data ?? [];
   const checkedAt = query.dataUpdatedAt;
 
@@ -31,6 +35,16 @@ export function SentScreen({ navigation }: TabScreenProps<'Sent'>) {
           </Text>
         ) : null}
       </Text>
+      {waiting && !photosAnyway ? (
+        <Notice
+          tone="info"
+          icon="upload"
+          title="Your reports are using the connection"
+          action={<Button label="Load photos anyway" variant="secondary" compact onPress={() => setPhotosAnyway(true)} />}
+        >
+          Until they are sent, this list only refreshes when you pull down, and photos load when you ask.
+        </Notice>
+      ) : null}
       {query.isError ? (
         <Notice
           tone="amber"
@@ -49,7 +63,9 @@ export function SentScreen({ navigation }: TabScreenProps<'Sent'>) {
       <FlatList
         data={reports}
         keyExtractor={r => r.id}
-        renderItem={({ item }) => <SentCard report={item} onPress={() => navigation.navigate('SentReport', { id: item.id })} />}
+        renderItem={({ item }) => (
+          <SentCard report={item} showThumbs={showThumbs} onPress={() => navigation.navigate('SentReport', { id: item.id })} />
+        )}
         ListHeaderComponent={header}
         ListEmptyComponent={query.isPending ? <Loading /> : query.isError ? undefined : <Empty />}
         ItemSeparatorComponent={() => <View style={{ height: space[3] }} />}
@@ -62,7 +78,7 @@ export function SentScreen({ navigation }: TabScreenProps<'Sent'>) {
   );
 }
 
-function SentCard({ report, onPress }: { report: ServerReport; onPress: () => void }) {
+function SentCard({ report, showThumbs, onPress }: { report: ServerReport; showThumbs: boolean; onPress: () => void }) {
   return (
     <Pressable
       onPress={onPress}
@@ -84,9 +100,13 @@ function SentCard({ report, onPress }: { report: ServerReport; onPress: () => vo
         </View>
       </View>
       <View style={styles.thumbs}>
-        {report.images.map(img => (
-          <Image key={img.id} source={{ uri: imageUrl(img.thumbUrl) }} style={styles.thumb} resizeMethod="resize" />
-        ))}
+        {report.images.map(img =>
+          showThumbs ? (
+            <Image key={img.id} source={{ uri: imageUrl(img.thumbUrl) }} style={styles.thumb} resizeMethod="resize" />
+          ) : (
+            <View key={img.id} style={styles.thumb} />
+          ),
+        )}
       </View>
     </Pressable>
   );

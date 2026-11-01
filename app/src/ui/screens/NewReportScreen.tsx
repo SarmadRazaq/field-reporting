@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
+  AccessibilityInfo,
   Alert,
   BackHandler,
   KeyboardAvoidingView,
@@ -9,12 +10,15 @@ import {
   TextInput,
   ToastAndroid,
   useWindowDimensions,
+  Vibration,
   View,
 } from 'react-native';
 import { launchCamera, launchImageLibrary, type ImagePickerResponse } from 'react-native-image-picker';
+import { requestNotifications } from 'react-native-permissions';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { draftIssues, photoSlotsLeft, type DraftIssue } from '../../core/rules';
 import { LIMITS } from '../../core/types';
+import { isNoSpaceError } from '../../infra/deviceStorage';
 import { outbox } from '../../infra/outbox';
 import { Button } from '../components/Button';
 import { Notice } from '../components/Notice';
@@ -22,6 +26,7 @@ import { PhotoTile } from '../components/PhotoTile';
 import { TopBar } from '../components/TopBar';
 import { useCameraPermission } from '../hooks/useCameraPermission';
 import { useDraft } from '../hooks/useDraft';
+import { useFreeSpace } from '../hooks/useFreeSpace';
 import type { RootScreenProps } from '../navigation/types';
 import { color, radius, space, type } from '../theme';
 
@@ -39,6 +44,7 @@ export function NewReportScreen({ navigation }: RootScreenProps<'NewReport'>) {
   const { width } = useWindowDimensions();
   const { draft, description, setDescription, flush } = useDraft();
   const camera = useCameraPermission();
+  const storage = useFreeSpace();
   const [adding, setAdding] = useState(0);
   const [saving, setSaving] = useState(false);
 
@@ -47,6 +53,7 @@ export function NewReportScreen({ navigation }: RootScreenProps<'NewReport'>) {
   const issues = draftIssues({ description, images });
   const tile = Math.floor((width - space[5] * 2 - space[2] * (COLUMNS - 1)) / COLUMNS);
   const cameraBlocked = camera.status === 'blocked' || camera.status === 'unavailable';
+  const noRoom = storage.level === 'full';
 
   const leave = useCallback(async () => {
     await flush();
@@ -78,27 +85,41 @@ export function NewReportScreen({ navigation }: RootScreenProps<'NewReport'>) {
     return () => sub.remove();
   }, [leave]);
 
-  async function addFrom(result: ImagePickerResponse) {
-    if (result.didCancel || !draft) return;
+  /** Copies the picked photos in; returns how many were added. */
+  async function addFrom(result: ImagePickerResponse): Promise<number> {
+    if (result.didCancel || !draft) return 0;
     if (result.errorCode) {
       ToastAndroid.show(result.errorCode === 'camera_unavailable' ? 'No camera on this device' : 'Could not open the photos', ToastAndroid.LONG);
-      return;
+      return 0;
     }
     const uris = (result.assets ?? []).map(a => a.uri).filter((u): u is string => !!u);
     setAdding(uris.length);
     try {
       const added = await outbox().addPhotos(draft.id, uris);
       if (added < uris.length) ToastAndroid.show(`Added ${added}. A report holds ${LIMITS.maxImages} photos.`, ToastAndroid.LONG);
-    } catch {
-      ToastAndroid.show('That photo could not be copied. Try another.', ToastAndroid.LONG);
+      return added;
+    } catch (e) {
+      ToastAndroid.show(
+        isNoSpaceError(e) ? 'The phone is out of storage. Free up space, then add the photo again.' : 'That photo could not be copied. Try another.',
+        ToastAndroid.LONG,
+      );
+      return 0;
     } finally {
       setAdding(0);
+      storage.refresh();
     }
   }
 
-  async function takePhoto() {
+  /** One photo at a time, offering the next straight away: fewer taps with gloves on. */
+  async function takePhoto(taken = images.length) {
     if (!(await camera.ensure())) return;
-    addFrom(await launchCamera({ mediaType: 'photo', quality: 1, saveToPhotos: false, includeExtra: false }));
+    const added = await addFrom(await launchCamera({ mediaType: 'photo', quality: 1, saveToPhotos: false, includeExtra: false }));
+    const count = taken + added;
+    if (!added || count >= LIMITS.maxImages) return;
+    Alert.alert(`Photo added · ${count} of ${LIMITS.maxImages}`, undefined, [
+      { text: 'Done', style: 'cancel' },
+      { text: 'Take another', onPress: () => void takePhoto(count) },
+    ]);
   }
 
   async function pickFromGallery() {
@@ -112,8 +133,13 @@ export function NewReportScreen({ navigation }: RootScreenProps<'NewReport'>) {
     const result = await outbox().submit(draft.id);
     setSaving(false);
     if (!result.ok) return;
+    Vibration.vibrate(20);
+    AccessibilityInfo.announceForAccessibility('Saved on this phone');
     ToastAndroid.show('Saved on this phone', ToastAndroid.SHORT);
     navigation.goBack();
+    // Asked now, when it means something: the notification is what lets sending go on in the background.
+    // Android only shows the system prompt once; later calls return the stored answer.
+    requestNotifications(['alert']).catch(() => {});
   }
 
   const full = slots === 0;
@@ -175,6 +201,14 @@ export function NewReportScreen({ navigation }: RootScreenProps<'NewReport'>) {
             </Text>
           )}
 
+          {noRoom || storage.level === 'low' ? (
+            <Notice tone="amber" icon="warning" title={noRoom ? 'This phone is out of storage' : 'This phone is low on storage'}>
+              {noRoom
+                ? 'Free up space in Settings to add photos. Reports already saved are safe.'
+                : 'There may not be room for several full-size photos. Reports already saved are safe.'}
+            </Notice>
+          ) : null}
+
           {cameraBlocked ? (
             <Notice
               tone="amber"
@@ -193,8 +227,8 @@ export function NewReportScreen({ navigation }: RootScreenProps<'NewReport'>) {
               icon="camera"
               variant="navy"
               compact
-              disabled={full || cameraBlocked || adding > 0}
-              onPress={takePhoto}
+              disabled={full || cameraBlocked || noRoom || adding > 0}
+              onPress={() => void takePhoto()}
             />
             <Button
               style={styles.source}
@@ -202,7 +236,7 @@ export function NewReportScreen({ navigation }: RootScreenProps<'NewReport'>) {
               icon="gallery"
               variant="secondary"
               compact
-              disabled={full || adding > 0}
+              disabled={full || noRoom || adding > 0}
               onPress={pickFromGallery}
             />
           </View>
@@ -219,7 +253,9 @@ export function NewReportScreen({ navigation }: RootScreenProps<'NewReport'>) {
           disabled={!draft || issues.length > 0 || adding > 0 || saving}
           disabledReason={adding > 0 ? 'Adding photos…' : issues[0] ? REASON[issues[0]] : undefined}
         />
-        <Text style={[type.caption, styles.hint]}>Saves on this phone, then sends by itself when there is signal.</Text>
+        {issues.length === 0 && adding === 0 ? (
+          <Text style={[type.caption, styles.hint]}>Saves on this phone, then sends by itself when there is signal.</Text>
+        ) : null}
       </View>
     </KeyboardAvoidingView>
   );

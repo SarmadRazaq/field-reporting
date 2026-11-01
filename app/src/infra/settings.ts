@@ -34,6 +34,16 @@ export const contactStore = {
   },
 };
 
+/** Set before Start over begins and removed with the other settings at its end; still there at launch means it was interrupted. */
+export const resetMarker = {
+  isSet(): boolean {
+    return database().executeSync("SELECT 1 FROM settings WHERE key = 'resetPending'").rows.length > 0;
+  },
+  set() {
+    database().executeSync("INSERT OR REPLACE INTO settings (key, value) VALUES ('resetPending', '1')");
+  },
+};
+
 export function clearSettings() {
   database().executeSync('DELETE FROM settings');
   serverUrl = null;
