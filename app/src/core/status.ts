@@ -65,7 +65,10 @@ export function describeReport(r: LocalReport, activity: Activity | null, now: n
 
 /** The one-glance answer at the top of the home screen. */
 export function summarize(snapshot: OutboxSnapshot, now: number): StatusLine {
-  const pending = snapshot.reports.filter(r => PENDING_STATES.includes(r.state));
+  // Oldest first, the order they upload in, so "report 1 of 3" is the one going first.
+  const pending = snapshot.reports
+    .filter(r => PENDING_STATES.includes(r.state))
+    .sort((a, b) => (a.createdAt ?? '').localeCompare(b.createdAt ?? ''));
   const attention = snapshot.reports.filter(r => r.state === 'needs_attention');
   const uploaded = snapshot.reports.filter(r => r.state === 'uploaded');
 
