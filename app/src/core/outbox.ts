@@ -251,6 +251,17 @@ export class Outbox {
     this.log('[outbox] reset');
   }
 
+  /**
+   * Stop uploading and refuse further writes, leaving everything on disk.
+   * Equivalent to the process dying, as far as the stored state is concerned.
+   */
+  async stop(): Promise<void> {
+    this.epoch += 1;
+    this.abort.abort();
+    this.clearWake();
+    await this.idle();
+  }
+
   // ── Internals ──────────────────────────────────────────────────────────────
 
   private async drain(): Promise<void> {

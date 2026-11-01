@@ -1,0 +1,17 @@
+{
+  "name": "field-reports-sim",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Runs the app's upload core in Node against the real server, through the brief's main scenario",
+  "type": "module",
+  "scripts": {
+    "sim": "tsx main.ts"
+  },
+  "dependencies": {
+    "sharp": "^0.35.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.23.15"
+  }
+}
