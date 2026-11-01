@@ -104,8 +104,9 @@ describe('delivery', () => {
     await flush();
     await w.outbox.idle();
     const summary = summarize(w.outbox.getSnapshot(), w.clock.now());
-    expect(summary.title).toBe('3 reports saved on this phone');
-    expect(summary.detail).toMatch(/Waiting for signal/);
+    expect(summary).toEqual({ kind: 'waiting', text: 'No signal · 3 reports on this phone' });
+    const first = w.outbox.getSnapshot().reports[0]!;
+    expect(describeReport(first, null, w.clock.now())).toMatchObject({ kind: 'waiting', label: 'Waiting for signal' });
 
     w.server.offline = false;
     w.outbox.connectivityChanged(true);
@@ -155,7 +156,7 @@ describe('delivery', () => {
     expect(w.server.requests.length).toBe(before);
     const [report] = w.outbox.getSnapshot().reports;
     expect(report!.state).toBe('needs_attention');
-    expect(describeReport(report!, null, w.clock.now()).tone).toBe('attention');
+    expect(describeReport(report!, null, w.clock.now())).toMatchObject({ kind: 'refused', label: "Couldn't send" });
 
     // The user fixes the server and taps Retry.
     await w.outbox.retryReport(report!.id);
@@ -268,13 +269,17 @@ describe('reset', () => {
 });
 
 describe('what the user is told', () => {
-  it('never puts "saved" and "uploaded" in one sentence', async () => {
+  it('never puts "saved" and "sent" in one sentence', async () => {
     const w = await world();
     const seen = new Set<string>();
     w.outbox.subscribe(() => {
       const s = w.outbox.getSnapshot();
-      const lines = [summarize(s, w.clock.now()), ...s.reports.map(r => describeReport(r, s.activity, w.clock.now()))];
-      for (const l of lines) for (const text of [l.title, l.detail ?? '']) seen.add(text);
+      seen.add(summarize(s, w.clock.now()).text);
+      for (const r of s.reports) {
+        const status = describeReport(r, s.activity, w.clock.now());
+        seen.add(status.label);
+        seen.add(status.detail ?? '');
+      }
     });
     w.server.inject('chunk', { kind: 'offline' }, 2);
     w.server.inject('manifest', { kind: 'status', status: 500 });
@@ -288,6 +293,6 @@ describe('what the user is told', () => {
       const uploaded = /\buploaded\b/i.test(text);
       expect({ text, both: saved && uploaded }).toEqual({ text, both: false });
     }
-    expect(summarize(w.outbox.getSnapshot(), w.clock.now()).title).toBe('Everything is on the server');
+    expect(summarize(w.outbox.getSnapshot(), w.clock.now()).kind).toBe('all-sent');
   });
 });
