@@ -10,3 +10,7 @@ coverage/
 
 # server runtime data
 server/data/
+
+# Local notes (not part of the submission)
+checklist.md
+.claude/
