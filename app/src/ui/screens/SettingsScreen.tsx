@@ -6,11 +6,10 @@ import { PENDING_STATES } from '../../core/types';
 import { startOver, deleteServerReports, type ResetResult } from '../../infra/reset';
 import { pingServer } from '../../infra/serverApi';
 import { DEFAULT_SERVER_URL, getServerUrl, setServerUrl } from '../../infra/settings';
-import { outbox } from '../../infra/outbox';
 import { Button } from '../components/Button';
 import { Notice } from '../components/Notice';
 import { Sheet } from '../components/Sheet';
-import { useOutbox } from '../hooks/useOutbox';
+import { useOutbox, useOutboxCommands } from '../hooks/useOutbox';
 import type { TabScreenProps } from '../navigation/types';
 import { color, radius, space, type } from '../theme';
 
@@ -19,6 +18,7 @@ type Check = { state: 'idle' } | { state: 'checking' } | { state: 'ok' } | { sta
 export function SettingsScreen(_: TabScreenProps<'Settings'>) {
   const insets = useSafeAreaInsets();
   const snapshot = useOutbox();
+  const box = useOutboxCommands();
   const queryClient = useQueryClient();
   const [url, setUrl] = useState(getServerUrl);
   const [check, setCheck] = useState<Check>({ state: 'idle' });
@@ -38,7 +38,7 @@ export function SettingsScreen(_: TabScreenProps<'Settings'>) {
       await pingServer();
       setCheck({ state: 'ok' });
       queryClient.invalidateQueries();
-      outbox().retryNow('server changed');
+      box.retryNow('server changed');
     } catch (e) {
       setCheck({ state: 'failed', message: e instanceof Error ? e.message : String(e) });
     }
@@ -95,7 +95,7 @@ export function SettingsScreen(_: TabScreenProps<'Settings'>) {
             Photos are made smaller before sending: up to 4096 px on the long edge and always under 5 MB.
           </Text>
           {sentReceipts ? (
-            <Button label="Clear sent from the list" variant="secondary" compact onPress={() => outbox().clearUploaded()} />
+            <Button label="Clear sent from the list" variant="secondary" compact onPress={() => box.clearUploaded()} />
           ) : null}
         </Section>
 

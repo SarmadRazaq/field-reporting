@@ -4,14 +4,13 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { clockTime, summarize } from '../../core/status';
 import type { LocalReport } from '../../core/types';
 import { PENDING_STATES } from '../../core/types';
-import { outbox } from '../../infra/outbox';
 import { Button } from '../components/Button';
 import { Icon } from '../components/Icon';
 import { ReportRow } from '../components/ReportRow';
 import { SendingHero } from '../components/SendingHero';
 import { SignalPill } from '../components/SignalPill';
 import { useNow } from '../hooks/useNow';
-import { useOutbox } from '../hooks/useOutbox';
+import { useOutbox, useOutboxCommands } from '../hooks/useOutbox';
 import type { TabScreenProps } from '../navigation/types';
 import { color, radius, space, type } from '../theme';
 
@@ -24,9 +23,10 @@ const rank = (r: LocalReport) => (r.state === 'needs_attention' ? 0 : PENDING_ST
 export function ReportsScreen({ navigation }: TabScreenProps<'Reports'>) {
   const insets = useSafeAreaInsets();
   const snapshot = useOutbox();
+  const box = useOutboxCommands();
   const now = useNow(10_000);
   const summary = summarize(snapshot, now);
-  const stuck = summary.kind === 'waiting';
+  const stuck = summary.kind === 'waiting' || summary.kind === 'stuck';
 
   const draft = snapshot.reports.find(r => r.state === 'draft');
   const active = snapshot.activity;
@@ -59,7 +59,7 @@ export function ReportsScreen({ navigation }: TabScreenProps<'Reports'>) {
                 : 'Has not reached the server yet'}
             </Text>
             <Pressable
-              onPress={() => outbox().retryNow('user')}
+              onPress={() => box.retryNow('user')}
               style={styles.tryNow}
               accessibilityRole="button"
               accessibilityLabel="Try sending now"

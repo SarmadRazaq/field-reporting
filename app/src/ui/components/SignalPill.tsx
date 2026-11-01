@@ -8,13 +8,24 @@ const ICON: Record<Summary['kind'], IconName> = {
   'all-sent': 'cloudCheck',
   sending: 'upload',
   waiting: 'noSignal',
+  stuck: 'warning',
   attention: 'warning',
+};
+
+/** Blue while things are fine or just slow; amber and red when someone should look. */
+const BACKGROUND: Partial<Record<Summary['kind'], string>> = {
+  stuck: color.amber700,
+  attention: color.red700,
 };
 
 /** The one connection summary at the top of Reports. */
 export function SignalPill({ summary }: { summary: Summary }) {
   return (
-    <View style={styles.pill} accessibilityLiveRegion="polite" accessibilityLabel={summary.text}>
+    <View
+      style={[styles.pill, BACKGROUND[summary.kind] ? { backgroundColor: BACKGROUND[summary.kind] } : null]}
+      accessibilityLiveRegion="polite"
+      accessibilityLabel={summary.text}
+    >
       <Icon name={ICON[summary.kind]} size={15} color={color.white} />
       <Text style={[type.chip, styles.text]} numberOfLines={1}>
         {summary.text}

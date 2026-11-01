@@ -19,7 +19,6 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { draftIssues, photoSlotsLeft, type DraftIssue } from '../../core/rules';
 import { LIMITS } from '../../core/types';
 import { isNoSpaceError } from '../../infra/deviceStorage';
-import { outbox } from '../../infra/outbox';
 import { Button } from '../components/Button';
 import { Notice } from '../components/Notice';
 import { PhotoTile } from '../components/PhotoTile';
@@ -27,6 +26,7 @@ import { TopBar } from '../components/TopBar';
 import { useCameraPermission } from '../hooks/useCameraPermission';
 import { useDraft } from '../hooks/useDraft';
 import { useFreeSpace } from '../hooks/useFreeSpace';
+import { useOutboxCommands } from '../hooks/useOutbox';
 import type { RootScreenProps } from '../navigation/types';
 import { color, radius, space, type } from '../theme';
 
@@ -35,22 +35,29 @@ const REASON: Record<DraftIssue, string> = {
   description_required: 'Describe what you found',
   description_too_long: `Keep the description under ${LIMITS.maxDescriptionChars} characters`,
   too_many_photos: `A report holds at most ${LIMITS.maxImages} photos`,
+  photo_problem: "Remove the photo that can't be used",
 };
 
 const COLUMNS = 3;
 
+/** Something about adding photos the inspector needs to see; stays until dismissed or fixed. */
+type PhotoNote = { tone: 'amber' | 'info'; title: string; text: string };
+
 export function NewReportScreen({ navigation }: RootScreenProps<'NewReport'>) {
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
+  const { drafts } = useOutboxCommands();
   const { draft, description, setDescription, flush } = useDraft();
   const camera = useCameraPermission();
   const storage = useFreeSpace();
   const [adding, setAdding] = useState(0);
   const [saving, setSaving] = useState(false);
+  const [note, setNote] = useState<PhotoNote | null>(null);
 
   const images = draft?.images ?? [];
   const slots = draft ? photoSlotsLeft(draft) : LIMITS.maxImages;
   const issues = draftIssues({ description, images });
+  const unusable = images.flatMap((img, i) => (img.problem ? [{ index: i, message: img.problem.message }] : []));
   const tile = Math.floor((width - space[5] * 2 - space[2] * (COLUMNS - 1)) / COLUMNS);
   const cameraBlocked = camera.status === 'blocked' || camera.status === 'unavailable';
   const noRoom = storage.level === 'full';
@@ -59,7 +66,7 @@ export function NewReportScreen({ navigation }: RootScreenProps<'NewReport'>) {
     await flush();
     const hasContent = description.trim().length > 0 || images.length > 0;
     if (!hasContent) {
-      if (draft) await outbox().discardDraft(draft.id);
+      if (draft) await drafts.discard(draft.id);
       navigation.goBack();
       return;
     }
@@ -69,13 +76,13 @@ export function NewReportScreen({ navigation }: RootScreenProps<'NewReport'>) {
         text: 'Delete it',
         style: 'destructive',
         onPress: async () => {
-          if (draft) await outbox().discardDraft(draft.id);
+          if (draft) await drafts.discard(draft.id);
           navigation.goBack();
         },
       },
       { text: 'Keep for later', onPress: () => navigation.goBack() },
     ]);
-  }, [description, draft, flush, images.length, navigation]);
+  }, [description, draft, drafts, flush, images.length, navigation]);
 
   useEffect(() => {
     const sub = BackHandler.addEventListener('hardwareBackPress', () => {
@@ -89,19 +96,30 @@ export function NewReportScreen({ navigation }: RootScreenProps<'NewReport'>) {
   async function addFrom(result: ImagePickerResponse): Promise<number> {
     if (result.didCancel || !draft) return 0;
     if (result.errorCode) {
-      ToastAndroid.show(result.errorCode === 'camera_unavailable' ? 'No camera on this device' : 'Could not open the photos', ToastAndroid.LONG);
+      setNote(
+        result.errorCode === 'camera_unavailable'
+          ? { tone: 'amber', title: 'No camera on this device', text: 'You can still add photos from the gallery.' }
+          : { tone: 'amber', title: "Couldn't open the photos", text: result.errorMessage ?? 'Try again, or use the other button.' },
+      );
       return 0;
     }
     const uris = (result.assets ?? []).map(a => a.uri).filter((u): u is string => !!u);
     setAdding(uris.length);
+    setNote(null);
     try {
-      const added = await outbox().addPhotos(draft.id, uris);
-      if (added < uris.length) ToastAndroid.show(`Added ${added}. A report holds ${LIMITS.maxImages} photos.`, ToastAndroid.LONG);
+      const added = await drafts.addPhotos(draft.id, uris);
+      if (added < uris.length)
+        setNote({
+          tone: 'info',
+          title: `Added ${added} of ${uris.length}`,
+          text: `A report holds ${LIMITS.maxImages} photos. Start another report for the rest.`,
+        });
       return added;
     } catch (e) {
-      ToastAndroid.show(
-        isNoSpaceError(e) ? 'The phone is out of storage. Free up space, then add the photo again.' : 'That photo could not be copied. Try another.',
-        ToastAndroid.LONG,
+      setNote(
+        isNoSpaceError(e)
+          ? { tone: 'amber', title: 'The phone is out of storage', text: 'Free up space, then add the photo again. Photos already added are safe.' }
+          : { tone: 'amber', title: "That photo couldn't be copied", text: 'Try taking it again, or pick another.' },
       );
       return 0;
     } finally {
@@ -130,7 +148,7 @@ export function NewReportScreen({ navigation }: RootScreenProps<'NewReport'>) {
     if (!draft || saving) return;
     setSaving(true);
     await flush();
-    const result = await outbox().submit(draft.id);
+    const result = await drafts.submit(draft.id);
     setSaving(false);
     if (!result.ok) return;
     Vibration.vibrate(20);
@@ -183,10 +201,11 @@ export function NewReportScreen({ navigation }: RootScreenProps<'NewReport'>) {
               {images.map((img, i) => (
                 <PhotoTile
                   key={img.id}
-                  uri={`file://${img.sourcePath}`}
+                  uri={`file://${img.processed?.path ?? img.sourcePath}`}
                   index={i}
                   size={tile}
-                  onRemove={() => draft && outbox().removePhoto(draft.id, img.id)}
+                  state={img.problem ? 'problem' : img.processed ? 'ready' : 'preparing'}
+                  onRemove={() => draft && drafts.removePhoto(draft.id, img.id)}
                 />
               ))}
               {Array.from({ length: adding }, (_, i) => (
@@ -200,6 +219,23 @@ export function NewReportScreen({ navigation }: RootScreenProps<'NewReport'>) {
               Add 1 to {LIMITS.maxImages}. Full-size camera photos are fine; they are made smaller before sending.
             </Text>
           )}
+
+          {unusable.map(u => (
+            <Notice key={u.index} tone="red" icon="warning" title={`Photo ${u.index + 1} can't be used`}>
+              {`${u.message}. Remove it with the × on the photo, then take it again.`}
+            </Notice>
+          ))}
+
+          {note ? (
+            <Notice
+              tone={note.tone}
+              icon={note.tone === 'info' ? 'gallery' : 'warning'}
+              title={note.title}
+              action={<Button label="OK" variant="secondary" compact onPress={() => setNote(null)} />}
+            >
+              {note.text}
+            </Notice>
+          ) : null}
 
           {noRoom || storage.level === 'low' ? (
             <Notice tone="amber" icon="warning" title={noRoom ? 'This phone is out of storage' : 'This phone is low on storage'}>

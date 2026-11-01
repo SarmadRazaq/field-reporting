@@ -7,6 +7,7 @@ const LOOK: Record<StatusKind, { bg: string; fg: string; icon: IconName }> = {
   draft: { bg: color.bg2, fg: color.ink7, icon: 'phone' },
   saved: { bg: color.bg2, fg: color.ink7, icon: 'phone' },
   waiting: { bg: color.bg2, fg: color.ink7, icon: 'clock' },
+  stuck: { bg: color.amber100, fg: color.amber700, icon: 'warning' },
   sending: { bg: color.amber100, fg: color.amber700, icon: 'upload' },
   sent: { bg: color.green100, fg: color.green700, icon: 'check' },
   refused: { bg: color.red100, fg: color.red700, icon: 'warning' },
@@ -15,7 +16,8 @@ const LOOK: Record<StatusKind, { bg: string; fg: string; icon: IconName }> = {
 /** Exactly one per report. Icon plus words, never colour alone. */
 export function StatusChip({ status, suffix }: { status: ReportStatus; suffix?: string }) {
   const look = LOOK[status.kind];
-  const countdown = status.kind === 'waiting' && status.retryInMs !== undefined ? duration(status.retryInMs) : null;
+  const countdown =
+    (status.kind === 'waiting' || status.kind === 'stuck') && status.retryInMs !== undefined ? duration(status.retryInMs) : null;
   return (
     <View style={[styles.chip, { backgroundColor: look.bg }]} accessibilityRole="text">
       <Icon name={look.icon} size={15} color={look.fg} />

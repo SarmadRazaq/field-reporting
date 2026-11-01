@@ -1,9 +1,9 @@
 import { useState } from 'react';
-import { ScrollView, Share, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
+import { Alert, ScrollView, Share, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
+import { launchCamera, launchImageLibrary, type ImagePickerResponse } from 'react-native-image-picker';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { clockTime, describeReport, duration, megabytes, reportBytes } from '../../core/status';
 import { PENDING_STATES } from '../../core/types';
-import { outbox } from '../../infra/outbox';
 import { Button } from '../components/Button';
 import { Icon } from '../components/Icon';
 import { Notice } from '../components/Notice';
@@ -12,17 +12,23 @@ import { ProgressSteps } from '../components/ProgressSteps';
 import { Sheet } from '../components/Sheet';
 import { StatusChip } from '../components/StatusChip';
 import { TopBar } from '../components/TopBar';
+import { useCameraPermission } from '../hooks/useCameraPermission';
 import { useNow } from '../hooks/useNow';
-import { useOutbox } from '../hooks/useOutbox';
+import { useOutbox, useOutboxCommands } from '../hooks/useOutbox';
 import type { RootScreenProps } from '../navigation/types';
 import { color, radius, space, type } from '../theme';
+
+const PICK = { mediaType: 'photo', quality: 1, includeExtra: false } as const;
 
 export function ReportDetailScreen({ navigation, route }: RootScreenProps<'ReportDetail'>) {
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
   const snapshot = useOutbox();
+  const box = useOutboxCommands();
+  const camera = useCameraPermission();
   const now = useNow();
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [replaceError, setReplaceError] = useState<string | null>(null);
   const report = snapshot.reports.find(r => r.id === route.params.id);
 
   if (!report) {
@@ -54,6 +60,35 @@ export function ReportDetailScreen({ navigation, route }: RootScreenProps<'Repor
           const note = i.processed ? `${i.processed.width} px · ${megabytes(i.processed.size)}` : 'Not prepared yet';
           return [{ id: i.id, path, note }];
         });
+
+  // The one photo the server (or the phone) refused, when the refusal names one.
+  const badIndex = report.problem?.imageId ? report.images.findIndex(i => i.id === report.problem!.imageId) : -1;
+
+  async function replaceWith(pick: () => Promise<ImagePickerResponse>) {
+    const imageId = report!.problem?.imageId;
+    const result = await pick();
+    const uri = result.assets?.[0]?.uri;
+    if (!imageId || result.didCancel || !uri) return;
+    setReplaceError(null);
+    try {
+      const id = await box.replacePhoto(report!.id, imageId, uri);
+      if (id) navigation.replace('ReportDetail', { id });
+    } catch {
+      setReplaceError("The new photo couldn't be copied. Try again, or pick another.");
+    }
+  }
+
+  function replacePhoto() {
+    Alert.alert(`Replace photo ${badIndex + 1}?`, 'The description and the other photos stay as they are. The report then sends by itself.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'From gallery', onPress: () => void replaceWith(() => launchImageLibrary({ ...PICK, selectionLimit: 1 })) },
+      {
+        text: 'Take a new one',
+        onPress: () =>
+          void replaceWith(async () => ((await camera.ensure()) ? launchCamera({ ...PICK, saveToPhotos: false }) : { didCancel: true })),
+      },
+    ]);
+  }
 
   async function shareDetails() {
     const lines = [
@@ -96,7 +131,20 @@ export function ReportDetailScreen({ navigation, route }: RootScreenProps<'Repor
               <Text style={[type.small, { color: color.soft }]}>Still saved on this phone. Nothing was lost.</Text>
               <Text style={[type.small, { color: color.ink }]}>{report.problem?.message}</Text>
             </Notice>
-            <Button label="Try once more" icon="refresh" onPress={() => outbox().retryReport(report.id)} />
+            {badIndex >= 0 ? (
+              <Button label={`Replace photo ${badIndex + 1}`} icon="camera" onPress={replacePhoto} />
+            ) : null}
+            {replaceError ? (
+              <Notice tone="amber" icon="warning" title="Photo not replaced">
+                {replaceError}
+              </Notice>
+            ) : null}
+            <Button
+              label="Try once more"
+              icon="refresh"
+              variant={badIndex >= 0 ? 'secondary' : undefined}
+              onPress={() => box.retryReport(report.id)}
+            />
             <Button label="Share details" icon="copy" variant="secondary" onPress={shareDetails} />
             <Button label="Delete this report" icon="trash" variant="danger" onPress={() => setConfirmDelete(true)} />
           </>
@@ -106,7 +154,7 @@ export function ReportDetailScreen({ navigation, route }: RootScreenProps<'Repor
 
         {canGoFirst ? (
           <View style={{ gap: space[2] }}>
-            <Button label="Send this one first" icon="upload" variant="navy" onPress={() => outbox().sendFirst(report.id)} />
+            <Button label="Send this one first" icon="upload" variant="navy" onPress={() => box.sendFirst(report.id)} />
             <Text style={[type.caption, { color: color.muted, textAlign: 'center' }]}>
               {ahead === 1 ? '1 other report is' : `${ahead} other reports are`} waiting too. The one being sent pauses and
               keeps what it has sent.
@@ -114,12 +162,12 @@ export function ReportDetailScreen({ navigation, route }: RootScreenProps<'Repor
           </View>
         ) : null}
 
-        {status.kind === 'waiting' ? (
+        {status.kind === 'waiting' || status.kind === 'stuck' ? (
           <Notice
-            tone="info"
-            icon="clock"
+            tone={status.kind === 'stuck' ? 'amber' : 'info'}
+            icon={status.kind === 'stuck' ? 'warning' : 'clock'}
             title={status.label}
-            action={<Button label="Try now" variant="secondary" compact onPress={() => outbox().retryNow('user')} />}
+            action={<Button label="Try now" variant="secondary" compact onPress={() => box.retryNow('user')} />}
           >
             {`${status.detail}. Next try in ${duration(status.retryInMs ?? 0)}. ${
               snapshot.lastContactAt
@@ -133,7 +181,12 @@ export function ReportDetailScreen({ navigation, route }: RootScreenProps<'Repor
           <View style={styles.grid}>
             {photos.map((p, i) => (
               <View key={p.id} style={{ gap: 4 }}>
-                <PhotoTile uri={`file://${p.path}`} index={i} size={tile} />
+                <PhotoTile
+                  uri={`file://${p.path}`}
+                  index={i}
+                  size={tile}
+                  state={p.id === report.problem?.imageId ? 'problem' : 'ready'}
+                />
                 <Text style={[type.meta, { color: color.muted }]}>{p.note}</Text>
               </View>
             ))}
@@ -153,7 +206,7 @@ export function ReportDetailScreen({ navigation, route }: RootScreenProps<'Repor
           variant="destructive"
           onPress={async () => {
             setConfirmDelete(false);
-            await outbox().discardReport(report.id);
+            await box.discardReport(report.id);
             navigation.goBack();
           }}
         />
