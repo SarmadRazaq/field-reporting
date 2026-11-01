@@ -4,6 +4,7 @@ import { summarize } from '../core/status';
 import type { OutboxSnapshot } from '../core/types';
 import { PENDING_STATES } from '../core/types';
 import { outbox } from './outbox';
+import { finishInterruptedReset } from './reset';
 import { uploadService } from './uploadService';
 
 /**
@@ -97,6 +98,8 @@ export function startBackgroundWork(): () => void {
 /** Run the uploader for a bounded time: used by WorkManager wake-ups. */
 export async function sendForAWhile(): Promise<void> {
   const box = outbox();
+  // A wake-up can come before the app is next opened; never send what an interrupted reset meant to wipe.
+  await finishInterruptedReset();
   await box.start();
   box.retryNow('background wake-up');
   await Promise.race([box.idle(), new Promise(r => setTimeout(r, HEADLESS_BUDGET_MS))]);
