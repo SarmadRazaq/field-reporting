@@ -1,9 +1,10 @@
 import { useCallback, useMemo } from 'react';
 import { FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { describeReport, summarize } from '../../core/status';
+import { clockTime, summarize } from '../../core/status';
 import type { LocalReport } from '../../core/types';
 import { PENDING_STATES } from '../../core/types';
+import { outbox } from '../../infra/outbox';
 import { Button } from '../components/Button';
 import { Icon } from '../components/Icon';
 import { ReportRow } from '../components/ReportRow';
@@ -14,14 +15,18 @@ import { useOutbox } from '../hooks/useOutbox';
 import type { TabScreenProps } from '../navigation/types';
 import { color, radius, space, type } from '../theme';
 
+/** Sent receipts drop off this list after a day; the Sent tab shows the server's own list. */
+const RECEIPT_MS = 24 * 60 * 60 * 1000;
+
 /** Order that answers "what needs me, what is moving, what is done". */
 const rank = (r: LocalReport) => (r.state === 'needs_attention' ? 0 : PENDING_STATES.includes(r.state) ? 1 : 2);
 
 export function ReportsScreen({ navigation }: TabScreenProps<'Reports'>) {
   const insets = useSafeAreaInsets();
   const snapshot = useOutbox();
-  const now = useNow();
+  const now = useNow(10_000);
   const summary = summarize(snapshot, now);
+  const stuck = summary.kind === 'waiting';
 
   const draft = snapshot.reports.find(r => r.state === 'draft');
   const active = snapshot.activity;
@@ -31,8 +36,10 @@ export function ReportsScreen({ navigation }: TabScreenProps<'Reports'>) {
     () =>
       snapshot.reports
         .filter(r => r.state !== 'draft' && r.id !== hero?.id)
+        .filter(r => r.state !== 'uploaded' || !r.uploadedAt || now - Date.parse(r.uploadedAt) < RECEIPT_MS)
         .sort((a, b) => rank(a) - rank(b) || (rank(a) === 1 ? (a.createdAt ?? '').localeCompare(b.createdAt ?? '') : 0)),
-    [snapshot.reports, hero?.id],
+    // `now` only matters for hiding old receipts; a 10 s tick is plenty.
+    [snapshot.reports, hero?.id, now],
   );
 
   const open = useCallback((id: string) => navigation.navigate('ReportDetail', { id }), [navigation]);
@@ -42,7 +49,26 @@ export function ReportsScreen({ navigation }: TabScreenProps<'Reports'>) {
       <Text style={[type.h1, { color: color.ink }]} accessibilityRole="header">
         Reports
       </Text>
-      <SignalPill summary={summary} />
+      <View style={{ gap: space[1] }}>
+        <SignalPill summary={summary} />
+        {stuck ? (
+          <View style={styles.contact}>
+            <Text style={[type.caption, { color: color.muted, flex: 1 }]}>
+              {snapshot.lastContactAt
+                ? `Last reached the server at ${clockTime(new Date(snapshot.lastContactAt).toISOString())}`
+                : 'Has not reached the server yet'}
+            </Text>
+            <Pressable
+              onPress={() => outbox().retryNow('user')}
+              style={styles.tryNow}
+              accessibilityRole="button"
+              accessibilityLabel="Try sending now"
+            >
+              <Text style={[type.bodyStrong, { color: color.brand }]}>Try now</Text>
+            </Pressable>
+          </View>
+        ) : null}
+      </View>
       {draft ? (
         <Pressable
           style={styles.draft}
@@ -69,7 +95,9 @@ export function ReportsScreen({ navigation }: TabScreenProps<'Reports'>) {
       <FlatList
         data={rows}
         keyExtractor={r => r.id}
-        renderItem={({ item }) => <ReportRow report={item} status={describeReport(item, active, now)} onPress={open} />}
+        renderItem={({ item }) => (
+          <ReportRow report={item} activity={active?.reportId === item.id ? active : null} onPress={open} />
+        )}
         ListHeaderComponent={header}
         ListEmptyComponent={hero ? undefined : <Empty />}
         contentContainerStyle={styles.list}
@@ -113,6 +141,8 @@ const styles = StyleSheet.create({
     borderStyle: 'dashed',
     overflow: 'hidden',
   },
+  contact: { flexDirection: 'row', alignItems: 'center', gap: space[2], paddingLeft: space[1] },
+  tryNow: { minHeight: 48, justifyContent: 'center', paddingHorizontal: space[2] },
   empty: { alignItems: 'center', gap: space[2], paddingVertical: space[6] * 2, paddingHorizontal: space[4] },
   footer: { paddingHorizontal: space[5], paddingBottom: space[2], backgroundColor: color.bg },
 });

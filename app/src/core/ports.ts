@@ -92,6 +92,12 @@ export const systemClock: Clock = {
   clearTimeout: h => clearTimeout(h as ReturnType<typeof setTimeout>),
 };
 
+/** Remembers when the server last answered, across launches. */
+export interface ContactStore {
+  get(): number | null;
+  set(at: number): void;
+}
+
 export interface Logger {
   (message: string): void;
 }

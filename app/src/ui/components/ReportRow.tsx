@@ -1,19 +1,24 @@
 import { memo } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
-import { clockTime, megabytes, reportBytes, type ReportStatus } from '../../core/status';
-import type { LocalReport } from '../../core/types';
+import { clockTime, describeReport, megabytes, reportBytes } from '../../core/status';
+import type { Activity, LocalReport } from '../../core/types';
+import { useNow } from '../hooks/useNow';
 import { color, radius, type } from '../theme';
 import { Icon } from './Icon';
 import { StatusChip } from './StatusChip';
 
 interface Props {
   report: LocalReport;
-  status: ReportStatus;
+  /** Only the activity for this report, so other rows don't re-render on every chunk. */
+  activity: Activity | null;
   onPress: (id: string) => void;
 }
 
 /** White card: time, title, photo count and size, one chip. A refused report gets a red border and a chevron. */
-export const ReportRow = memo(function ReportRow({ report, status, onPress }: Props) {
+export const ReportRow = memo(function ReportRow({ report, activity, onPress }: Props) {
+  // Only a row with a countdown needs to tick every second.
+  const now = useNow(report.nextAttemptAt !== null ? 1000 : 60_000);
+  const status = describeReport(report, activity, now);
   const refused = status.kind === 'refused';
   const photos = `${report.images.length} ${report.images.length === 1 ? 'photo' : 'photos'}`;
   return (

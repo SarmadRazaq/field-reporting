@@ -1,10 +1,10 @@
 import { ChunkSizer } from './chunking';
 import { deliver } from './deliver';
 import { photoPaths } from './processing';
-import type { Clock, FileStore, HttpClient, ImageEncoder, Logger, ReportRepo } from './ports';
-import { systemClock } from './ports';
+import type { Clock, ContactStore, FileStore, HttpClient, ImageEncoder, Logger, ReportRepo } from './ports';
+import { NetworkError, systemClock } from './ports';
 import { ProtocolClient } from './protocol';
-import { Cancelled, backoffMs, toFailure } from './retry';
+import { BACKOFF, Cancelled, backoffMs, toFailure } from './retry';
 import { draftIssues, photoSlotsLeft, type DraftIssue } from './rules';
 import { PENDING_STATES, type Activity, type LocalReport, type OutboxSnapshot } from './types';
 
@@ -17,7 +17,11 @@ export interface OutboxDeps {
   clock?: Clock;
   random?: () => number;
   log?: Logger;
+  contact?: ContactStore;
 }
+
+/** How often "the server answered" is written to disk at most. */
+const CONTACT_SAVE_MS = 10_000;
 
 export type SubmitResult = { ok: true } | { ok: false; issues: DraftIssue[] };
 
@@ -25,21 +29,28 @@ export type SubmitResult = { ok: true } | { ok: false; issues: DraftIssue[] };
  * The single owner of local reports. The UI calls commands and subscribes to
  * snapshots; the uploader runs inside. Works without React or any screen.
  *
- * One drain runs at a time and delivers reports oldest first, one at a time:
- * on 2G, parallel uploads only make every report slower.
+ * One drain runs at a time and delivers reports one at a time, oldest first
+ * unless the inspector asked for one to go first: on 2G, parallel uploads only
+ * make every report slower.
  */
 export class Outbox {
   private reports = new Map<string, LocalReport>();
-  private snapshot: OutboxSnapshot = { ready: false, reports: [], activity: null };
+  private snapshot: OutboxSnapshot = { ready: false, reports: [], activity: null, lastContactAt: null };
   private listeners = new Set<() => void>();
   private activity: Activity | null = null;
 
   private running: Promise<void> | null = null;
   private rerun = false;
   private wakeTimer: unknown = null;
-  private abort = new AbortController();
-  /** Bumped by reset; any write from an older epoch is refused. */
+  /** Aborts the requests of the current drain: for reset, stop, and "send this first". */
+  private run: AbortController | null = null;
+  /** Bumped by reset and stop; any write from an older epoch is refused. */
   private epoch = 0;
+  /** Last word from the OS. Only stretches backoff; never stops an attempt. */
+  private online = true;
+  private lastContactAt: number | null;
+  private contactSavedAt = 0;
+  private readonly http: HttpClient;
   private readonly chunks = new ChunkSizer();
   private readonly clock: Clock;
   private readonly random: () => number;
@@ -49,6 +60,15 @@ export class Outbox {
     this.clock = deps.clock ?? systemClock;
     this.random = deps.random ?? Math.random;
     this.log = deps.log ?? (() => {});
+    this.lastContactAt = deps.contact?.get() ?? null;
+    // Any HTTP answer, even an error status, proves the server is reachable.
+    this.http = {
+      send: async req => {
+        const res = await deps.http.send(req);
+        this.noteContact();
+        return res;
+      },
+    };
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -91,8 +111,25 @@ export class Outbox {
    * stop waiting out a backoff.
    */
   connectivityChanged(online: boolean): void {
+    this.online = online;
     if (!online) return;
     this.retryNow('connectivity');
+  }
+
+  /**
+   * Move a waiting report to the front. If another report is being sent, its
+   * current chunk is abandoned (the bytes already on the server are kept) and
+   * this one starts straight away.
+   */
+  async sendFirst(id: string): Promise<void> {
+    const r = this.reports.get(id);
+    if (!r || !PENDING_STATES.includes(r.state)) return;
+    await this.write({ ...r, sendFirstAt: this.clock.now(), nextAttemptAt: null });
+    if (this.running && this.activity?.reportId !== id) {
+      this.log(`[outbox] ${id} goes first; pausing ${this.activity?.reportId ?? 'current work'}`);
+      this.run?.abort();
+    }
+    this.kick('send first');
   }
 
   /** Forget backoff timers and try every pending report now. */
@@ -238,11 +275,11 @@ export class Outbox {
    */
   async reset(): Promise<void> {
     this.epoch += 1;
-    this.abort.abort();
+    this.run?.abort();
     this.clearWake();
     await this.idle();
-    this.abort = new AbortController();
     this.rerun = false;
+    this.lastContactAt = null;
     await this.deps.repo.clear();
     await this.deps.files.clearAll();
     this.reports.clear();
@@ -257,8 +294,9 @@ export class Outbox {
    */
   async stop(): Promise<void> {
     this.epoch += 1;
-    this.abort.abort();
+    this.run?.abort();
     this.clearWake();
+    this.rerun = false;
     await this.idle();
   }
 
@@ -266,12 +304,14 @@ export class Outbox {
 
   private async drain(): Promise<void> {
     const epoch = this.epoch;
-    const protocol = new ProtocolClient(this.deps.http, this.abort.signal);
     this.clearWake();
 
     while (epoch === this.epoch) {
       const next = this.nextDue();
       if (!next) break;
+      const run = new AbortController();
+      this.run = run;
+      const protocol = new ProtocolClient(this.http, run.signal);
       try {
         await deliver(
           {
@@ -289,6 +329,11 @@ export class Outbox {
         this.log(`[outbox] ${next.id} uploaded`);
       } catch (e) {
         if (epoch !== this.epoch || e instanceof Cancelled) return;
+        if (run.signal.aborted && e instanceof NetworkError && e.kind === 'aborted') {
+          // Pre-empted by "send this first". Not a failure: progress is on disk, pick the next due report.
+          this.setActivity(null, epoch);
+          continue;
+        }
         let failure;
         try {
           failure = toFailure(e);
@@ -306,7 +351,8 @@ export class Outbox {
           continue;
         }
         const attempts = current.attempts + 1;
-        const wait = Math.max(backoffMs(attempts, this.random), failure.type === 'transient' ? failure.retryAfterMs ?? 0 : 0);
+        const cap = this.online ? BACKOFF.maxMs : BACKOFF.offlineMaxMs;
+        const wait = Math.max(backoffMs(attempts, this.random, cap), failure.type === 'transient' ? failure.retryAfterMs ?? 0 : 0);
         this.log(`[outbox] ${next.id} attempt ${attempts} failed (${failure.message}); retry in ${Math.round(wait / 1000)}s`);
         await this.write(
           {
@@ -336,10 +382,25 @@ export class Outbox {
     return this.pending().find(r => r.nextAttemptAt === null || r.nextAttemptAt <= now);
   }
 
+  /** Upload order: reports asked to go first (in the order asked), then oldest first. */
   private pending(): LocalReport[] {
     return [...this.reports.values()]
       .filter(r => PENDING_STATES.includes(r.state))
-      .sort((a, b) => (a.createdAt ?? '').localeCompare(b.createdAt ?? ''));
+      .sort(
+        (a, b) =>
+          (a.sendFirstAt ?? Infinity) - (b.sendFirstAt ?? Infinity) ||
+          (a.createdAt ?? '').localeCompare(b.createdAt ?? ''),
+      );
+  }
+
+  private noteContact() {
+    const now = this.clock.now();
+    this.lastContactAt = now;
+    if (now - this.contactSavedAt >= CONTACT_SAVE_MS) {
+      this.contactSavedAt = now;
+      this.deps.contact?.set(now);
+      this.emit();
+    }
   }
 
   private scheduleWake() {
@@ -407,6 +468,7 @@ export class Outbox {
       ready,
       reports: [...this.reports.values()].sort((a, b) => (b.createdAt ?? '￿').localeCompare(a.createdAt ?? '￿')),
       activity: this.activity,
+      lastContactAt: this.lastContactAt,
     };
     for (const l of this.listeners) l();
   }

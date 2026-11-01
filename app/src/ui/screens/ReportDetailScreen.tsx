@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { ScrollView, Share, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { clockTime, describeReport, duration, megabytes, reportBytes } from '../../core/status';
+import { PENDING_STATES } from '../../core/types';
 import { outbox } from '../../infra/outbox';
 import { Button } from '../components/Button';
 import { Icon } from '../components/Icon';
@@ -37,12 +38,22 @@ export function ReportDetailScreen({ navigation, route }: RootScreenProps<'Repor
   }
 
   const status = describeReport(report, snapshot.activity, now);
+  const pending = snapshot.reports.filter(r => PENDING_STATES.includes(r.state));
+  const sendingThis = snapshot.activity?.reportId === report.id;
+  // Only worth offering when this report would otherwise wait behind another one.
+  const canGoFirst = PENDING_STATES.includes(report.state) && !sendingThis && pending.length > 1;
+  const ahead = pending.length - 1;
   const tile = Math.floor((width - space[5] * 2 - space[2] * 2) / 3);
   // Once the server confirms, the phone deletes its copies; the photos live on the server then.
   const photos =
     report.state === 'uploaded'
       ? []
-      : report.images.map(i => i.processed?.path ?? i.sourcePath).filter((p): p is string => !!p);
+      : report.images.flatMap(i => {
+          const path = i.processed?.path ?? i.sourcePath;
+          if (!path) return [];
+          const note = i.processed ? `${i.processed.width} px · ${megabytes(i.processed.size)}` : 'Not prepared yet';
+          return [{ id: i.id, path, note }];
+        });
 
   async function shareDetails() {
     const lines = [
@@ -93,6 +104,16 @@ export function ReportDetailScreen({ navigation, route }: RootScreenProps<'Repor
           <ProgressSteps report={report} activity={snapshot.activity} />
         )}
 
+        {canGoFirst ? (
+          <View style={{ gap: space[2] }}>
+            <Button label="Send this one first" icon="upload" variant="navy" onPress={() => outbox().sendFirst(report.id)} />
+            <Text style={[type.caption, { color: color.muted, textAlign: 'center' }]}>
+              {ahead === 1 ? '1 other report is' : `${ahead} other reports are`} waiting too. The one being sent pauses and
+              keeps what it has sent.
+            </Text>
+          </View>
+        ) : null}
+
         {status.kind === 'waiting' ? (
           <Notice
             tone="info"
@@ -100,14 +121,21 @@ export function ReportDetailScreen({ navigation, route }: RootScreenProps<'Repor
             title={status.label}
             action={<Button label="Try now" variant="secondary" compact onPress={() => outbox().retryNow('user')} />}
           >
-            {`${status.detail}. Next try in ${duration(status.retryInMs ?? 0)}.`}
+            {`${status.detail}. Next try in ${duration(status.retryInMs ?? 0)}. ${
+              snapshot.lastContactAt
+                ? `Last reached the server at ${clockTime(new Date(snapshot.lastContactAt).toISOString())}.`
+                : 'Has not reached the server yet.'
+            }`}
           </Notice>
         ) : null}
 
         {photos.length ? (
           <View style={styles.grid}>
             {photos.map((p, i) => (
-              <PhotoTile key={p} uri={`file://${p}`} index={i} size={tile} />
+              <View key={p.id} style={{ gap: 4 }}>
+                <PhotoTile uri={`file://${p.path}`} index={i} size={tile} />
+                <Text style={[type.meta, { color: color.muted }]}>{p.note}</Text>
+              </View>
             ))}
           </View>
         ) : status.kind === 'sent' ? (

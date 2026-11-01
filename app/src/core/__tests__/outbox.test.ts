@@ -188,6 +188,54 @@ describe('delivery', () => {
   });
 });
 
+describe('send this first', () => {
+  it('lets a small report overtake a big one mid-upload, and both land once', async () => {
+    const w = await world();
+    // Hold the big report's first chunk in flight, as a slow 2G upload would be.
+    w.server.inject('chunk', { kind: 'freeze' });
+    const big = await fileReport(w, [18 * MB, 18 * MB, 18 * MB, 18 * MB, 18 * MB], 'Big');
+    for (let i = 0; i < 10; i++) await flush();
+    expect(w.outbox.getSnapshot().activity).toMatchObject({ reportId: big, stage: 'uploading' });
+    const small = await fileReport(w, [2 * MB], 'Small');
+
+    await w.outbox.sendFirst(small);
+    await settle(w);
+
+    const commits = w.server.requests.filter(r => r.route === 'commit').map(r => r.path.split('/')[3]);
+    expect(commits[0]).toBe(small);
+    expect(w.server.committed()).toHaveLength(2);
+    expect(w.server.committed().every(r => r.commits === 1)).toBe(true);
+    expectIntact(w);
+    // Pausing is not a failure.
+    expect(w.logs.some(l => l.includes('attempt'))).toBe(false);
+  });
+});
+
+describe('contact and backoff', () => {
+  it('remembers when the server last answered', async () => {
+    const w = await world();
+    expect(w.outbox.getSnapshot().lastContactAt).toBeNull();
+    await fileReport(w, [1 * MB]);
+    await settle(w);
+    expect(w.outbox.getSnapshot().lastContactAt).toBe(w.clock.now());
+  });
+
+  it('waits longer between tries while the phone says it is offline', async () => {
+    const w = await world();
+    w.server.offline = true;
+    w.outbox.connectivityChanged(false);
+    await fileReport(w, [1 * MB]);
+    for (let i = 0; i < 12; i++) {
+      await flush();
+      await w.outbox.idle();
+      w.clock.fireNext();
+    }
+    await w.outbox.idle();
+    const [r] = w.outbox.getSnapshot().reports;
+    expect(r!.nextAttemptAt! - w.clock.now()).toBeGreaterThan(60_000);
+  });
+});
+
 describe('force-quit', () => {
   it('resumes mid-photo from the bytes the server already has', async () => {
     const w = await world();

@@ -94,6 +94,8 @@ export interface LocalReport {
   lastIssue: TransientIssue | null;
   problem: Problem | null;
   uploadedAt: string | null;
+  /** Set when the inspector asked for this report to go before the others. */
+  sendFirstAt?: number | null;
 }
 
 export type Stage = 'processing' | 'uploading' | 'committing';
@@ -113,4 +115,6 @@ export interface OutboxSnapshot {
   ready: boolean;
   reports: readonly LocalReport[];
   activity: Activity | null;
+  /** When the server last answered anything at all; null if never seen. */
+  lastContactAt: number | null;
 }

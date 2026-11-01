@@ -9,12 +9,18 @@ import { Segments } from './Segments';
 /** Navy card for the one report being sent right now. */
 export function SendingHero({ report, activity, onPress }: { report: LocalReport; activity: Activity; onPress: () => void }) {
   const left = useTimeLeft(activity);
-  const progress = activity.bytesTotal > 0 ? activity.bytesSent / activity.bytesTotal : 0;
+  const preparing = activity.stage === 'processing';
+  // While photos are being made smaller no bytes move, so show which photo instead of a stuck 0%.
+  const progress = preparing
+    ? activity.imageIndex / activity.imageCount
+    : activity.bytesTotal > 0
+      ? activity.bytesSent / activity.bytesTotal
+      : 0;
   const pct = Math.floor(progress * 100);
-  const caption =
-    activity.stage === 'processing'
-      ? `Preparing photo ${activity.imageIndex + 1} of ${activity.imageCount}`
-      : activity.stage === 'committing'
+  const figure = preparing ? `${activity.imageIndex + 1}/${activity.imageCount}` : `${pct}%`;
+  const caption = preparing
+    ? 'Making photos smaller to send'
+    : activity.stage === 'committing'
         ? 'Waiting for the server to confirm'
         : left !== null
           ? `${duration(left)} left`
@@ -26,12 +32,12 @@ export function SendingHero({ report, activity, onPress }: { report: LocalReport
       style={styles.card}
       android_ripple={{ color: 'rgba(255,255,255,0.12)' }}
       accessibilityRole="button"
-      accessibilityLabel={`Sending now: ${report.description}. ${pct} percent. ${caption}`}
+      accessibilityLabel={`${preparing ? 'Preparing' : 'Sending now'}: ${report.description}. ${preparing ? `Photo ${figure}` : `${pct} percent`}. ${caption}`}
     >
       <View style={styles.top}>
         <View style={styles.tag}>
           <Icon name="upload" size={15} color={color.white} />
-          <Text style={[type.chip, { color: color.white }]}>{activity.stage === 'processing' ? 'Preparing' : 'Sending now'}</Text>
+          <Text style={[type.chip, { color: color.white }]}>{preparing ? 'Preparing' : 'Sending now'}</Text>
         </View>
         <Text style={[type.meta, { color: color.onHeroSoft }]}>
           {report.images.length} {report.images.length === 1 ? 'photo' : 'photos'} · {megabytes(reportBytes(report))}
@@ -40,9 +46,9 @@ export function SendingHero({ report, activity, onPress }: { report: LocalReport
       <Text style={[type.heroTitle, styles.title]} numberOfLines={2}>
         {report.description}
       </Text>
-      <Segments progress={progress} cells={24} height={12} fill={color.white} empty="rgba(255,255,255,0.22)" />
+      <Segments progress={progress} cells={preparing ? activity.imageCount : 24} height={12} fill={color.white} empty="rgba(255,255,255,0.22)" />
       <View style={styles.bottom}>
-        <Text style={[type.figureSmall, { color: color.white }]}>{pct}%</Text>
+        <Text style={[type.figureSmall, { color: color.white }]}>{figure}</Text>
         <Text style={[type.small, { color: color.onHeroSoft }]}>{caption}</Text>
       </View>
     </Pressable>

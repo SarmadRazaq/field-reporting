@@ -5,7 +5,7 @@ import { BlobFileStore } from './BlobFileStore';
 import { database } from './db';
 import { NativeHttpClient } from './NativeHttpClient';
 import { ResizerEncoder } from './ResizerEncoder';
-import { getServerUrl } from './settings';
+import { contactStore, getServerUrl } from './settings';
 import { SqliteReportRepo } from './SqliteReportRepo';
 
 let instance: Outbox | null = null;
@@ -22,6 +22,7 @@ export function outbox(): Outbox {
       encoder: new ResizerEncoder(),
       http: new NativeHttpClient(getServerUrl),
       newId: uuid,
+      contact: contactStore,
       log: __DEV__ ? m => console.log(m) : undefined,
     });
   }

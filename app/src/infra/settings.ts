@@ -23,6 +23,17 @@ export function setServerUrl(url: string) {
   database().executeSync("INSERT OR REPLACE INTO settings (key, value) VALUES ('serverUrl', ?)", [serverUrl]);
 }
 
+/** When the server last answered, kept across launches so "last reached" survives a restart. */
+export const contactStore = {
+  get(): number | null {
+    const { rows } = database().executeSync("SELECT value FROM settings WHERE key = 'lastContactAt'");
+    return rows[0] ? Number(rows[0].value) : null;
+  },
+  set(at: number) {
+    database().executeSync("INSERT OR REPLACE INTO settings (key, value) VALUES ('lastContactAt', ?)", [String(at)]);
+  },
+};
+
 export function clearSettings() {
   database().executeSync('DELETE FROM settings');
   serverUrl = null;

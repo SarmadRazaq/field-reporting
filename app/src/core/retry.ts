@@ -77,13 +77,18 @@ export function toFailure(e: unknown): Failure {
   throw e;
 }
 
-export const BACKOFF = { baseMs: 2_000, maxMs: 60_000 } as const;
+/**
+ * maxMs applies while the phone reports a connection; offlineMaxMs while it
+ * says it has none (a reconnect retries immediately anyway, so waiting longer
+ * there only saves battery).
+ */
+export const BACKOFF = { baseMs: 2_000, maxMs: 60_000, offlineMaxMs: 300_000 } as const;
 
 /**
- * Exponential backoff with jitter: 2 s, 4 s, 8 s … capped at 60 s, each scaled
- * to between 50% and 100% so a fleet of phones doesn't retry in lockstep.
+ * Exponential backoff with jitter: 2 s, 4 s, 8 s … capped at `maxMs`, each
+ * scaled to between 50% and 100% so a fleet of phones doesn't retry in lockstep.
  */
-export function backoffMs(attempt: number, random: () => number = Math.random): number {
-  const exp = Math.min(BACKOFF.maxMs, BACKOFF.baseMs * 2 ** Math.max(0, attempt - 1));
+export function backoffMs(attempt: number, random: () => number = Math.random, maxMs: number = BACKOFF.maxMs): number {
+  const exp = Math.min(maxMs, BACKOFF.baseMs * 2 ** Math.max(0, attempt - 1));
   return Math.round(exp / 2 + (random() * exp) / 2);
 }
