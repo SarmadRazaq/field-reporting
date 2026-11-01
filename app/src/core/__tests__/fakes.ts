@@ -75,6 +75,8 @@ export class FakeEncoder implements ImageEncoder {
   /** Set to make encodes for a source never finish (simulates a kill mid-processing). */
   hangOn = new Set<string>();
   failOn = new Set<string>();
+  /** Encodes with a long edge above this throw, like an out-of-memory decode. */
+  failAboveEdge = Infinity;
   sizeFor = (sourceBytes: number, req: EncodeRequest) =>
     Math.round(sourceBytes * (req.maxEdge / 6000) ** 2 * (req.quality / 100) * 0.5);
   constructor(private readonly files: MemoryFiles) {}
@@ -82,6 +84,7 @@ export class FakeEncoder implements ImageEncoder {
     this.calls.push(req);
     if (this.hangOn.has(req.src)) await new Promise(() => {});
     if (this.failOn.has(req.src)) throw new Error('decode failed');
+    if (req.maxEdge > this.failAboveEdge) throw new Error('OutOfMemoryError');
     const src = this.files.files.get(req.src);
     if (!src) throw new Error('no source');
     const size = Math.max(1, this.sizeFor(src.length, req));

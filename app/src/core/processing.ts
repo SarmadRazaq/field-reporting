@@ -45,16 +45,16 @@ export async function processPhoto(
       problem: { code: 'photo_missing', message: `${label} is no longer on this phone`, imageId: image.id },
     });
 
+  let failures = 0;
   for (const step of QUALITY_LADDER) {
     let out: { size: number; width: number; height: number };
     try {
       out = await encoder.encodeJpeg({ src: image.sourcePath, dest: paths.tmp, ...step });
-    } catch (e) {
+    } catch {
+      // Often memory on a huge photo; a smaller target edge decodes at a coarser sample size.
+      failures += 1;
       await files.remove(paths.tmp);
-      throw new DeliveryError({
-        type: 'permanent',
-        problem: { code: 'photo_unreadable', message: `${label} could not be read as an image`, imageId: image.id },
-      });
+      continue;
     }
     if (out.size > LIMITS.targetImageBytes) {
       await files.remove(paths.tmp);
@@ -67,6 +67,13 @@ export async function processPhoto(
 
   throw new DeliveryError({
     type: 'permanent',
-    problem: { code: 'photo_unreadable', message: `${label} could not be made small enough to send`, imageId: image.id },
+    problem: {
+      code: 'photo_unreadable',
+      message:
+        failures === QUALITY_LADDER.length
+          ? `${label} could not be read as an image`
+          : `${label} could not be made small enough to send`,
+      imageId: image.id,
+    },
   });
 }

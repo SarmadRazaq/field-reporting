@@ -67,6 +67,25 @@ describe('delivery', () => {
     expectIntact(w);
   });
 
+  it('falls back to a smaller size when the encoder runs out of memory', async () => {
+    const w = await world();
+    w.encoder.failAboveEdge = 3072;
+    await fileReport(w, [20 * MB]);
+    await settle(w);
+    expect(w.server.committed()).toHaveLength(1);
+    expect(w.encoder.calls.map(c => c.maxEdge)).toEqual([4096, 4096, 3072]);
+  });
+
+  it('marks a photo that cannot be decoded at all', async () => {
+    const w = await world();
+    const id = await fileReport(w, [1 * MB]);
+    void id;
+    w.encoder.failAboveEdge = 0;
+    await settle(w);
+    const [report] = w.outbox.getSnapshot().reports;
+    expect(report!.problem).toMatchObject({ code: 'photo_unreadable', message: 'Photo 1 could not be read as an image' });
+  });
+
   it('gives up on a photo nothing can shrink, before any byte goes out', async () => {
     const w = await world();
     w.encoder.sizeFor = () => 7 * MB;
