@@ -4,7 +4,7 @@ import { Outbox } from '../core/outbox';
 import { BlobFileStore } from './BlobFileStore';
 import { database } from './db';
 import { NativeHttpClient } from './NativeHttpClient';
-import { ResizerEncoder } from './ResizerEncoder';
+import { NativePhotoEncoder } from './NativePhotoEncoder';
 import { contactStore, getServerUrl } from './settings';
 import { SqliteReportRepo } from './SqliteReportRepo';
 
@@ -19,7 +19,7 @@ export function outbox(): Outbox {
     instance = new Outbox({
       repo: new SqliteReportRepo(database()),
       files: new BlobFileStore(),
-      encoder: new ResizerEncoder(),
+      encoder: new NativePhotoEncoder(),
       http: new NativeHttpClient(getServerUrl),
       newId: uuid,
       contact: contactStore,

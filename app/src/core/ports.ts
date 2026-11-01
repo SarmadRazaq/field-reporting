@@ -31,17 +31,35 @@ export interface FileStore {
   clearAll(): Promise<void>;
 }
 
-export interface EncodeRequest {
-  src: string;
-  dest: string;
+export interface EncodeStep {
+  /** Longest edge in pixels; never scaled up. */
   maxEdge: number;
   /** 0–100 */
   quality: number;
 }
 
+export interface EncodeRequest {
+  src: string;
+  dest: string;
+  /** Tried in order; the first JPEG of at most `maxBytes` wins. */
+  steps: readonly EncodeStep[];
+  maxBytes: number;
+}
+
+export type EncodeResult =
+  | { kind: 'ok'; size: number; width: number; height: number }
+  /** No step could decode the photo (corrupt, unsupported format, out of memory at every size). */
+  | { kind: 'unreadable' }
+  /** It decoded, but even the last step came out over `maxBytes`. */
+  | { kind: 'too_large' };
+
 export interface ImageEncoder {
-  /** Decode, apply orientation, scale to fit `maxEdge`, and write a JPEG to `dest`. */
-  encodeJpeg(req: EncodeRequest): Promise<{ size: number; width: number; height: number }>;
+  /**
+   * Decode the photo (applying its orientation), then try each step until a
+   * JPEG fits, and write that one to `dest`. The policy (steps, limit) comes
+   * from the core; how few times the photo is decoded is up to the encoder.
+   */
+  encodeToFit(req: EncodeRequest): Promise<EncodeResult>;
 }
 
 export type HttpMethod = 'GET' | 'HEAD' | 'PUT' | 'POST' | 'PATCH' | 'DELETE';

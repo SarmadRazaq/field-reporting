@@ -6,6 +6,7 @@ import sharp from 'sharp';
 import {
   NetworkError,
   type EncodeRequest,
+  type EncodeResult,
   type FileStore,
   type HttpClient,
   type HttpRequest,
@@ -13,6 +14,7 @@ import {
   type ImageEncoder,
   type ReportRepo,
 } from '../app/src/core/ports';
+import { parseReport, serializeReport } from '../app/src/core/schema';
 import type { LocalReport } from '../app/src/core/types';
 
 /** One JSON file per report, written to a temp file and renamed so each save is atomic. */
@@ -21,12 +23,12 @@ export class JsonFileRepo implements ReportRepo {
   async load() {
     await fs.mkdir(this.dir, { recursive: true });
     const names = (await fs.readdir(this.dir)).filter(n => n.endsWith('.json'));
-    return Promise.all(names.map(async n => JSON.parse(await fs.readFile(path.join(this.dir, n), 'utf8')) as LocalReport));
+    return Promise.all(names.map(async n => parseReport(await fs.readFile(path.join(this.dir, n), 'utf8'))));
   }
   async save(r: LocalReport) {
     await fs.mkdir(this.dir, { recursive: true });
     const file = path.join(this.dir, `${r.id}.json`);
-    await fs.writeFile(`${file}.tmp`, JSON.stringify(r));
+    await fs.writeFile(`${file}.tmp`, serializeReport(r));
     await fs.rename(`${file}.tmp`, file);
   }
   async remove(id: string) {
@@ -66,14 +68,28 @@ export class NodeFiles implements FileStore {
   }
 }
 
+/** The phone's encoder, played by sharp: decode once, try each step, keep the first that fits. */
 export class SharpEncoder implements ImageEncoder {
-  async encodeJpeg({ src, dest, maxEdge, quality }: EncodeRequest) {
-    const info = await sharp(src)
-      .rotate()
-      .resize({ width: maxEdge, height: maxEdge, fit: 'inside', withoutEnlargement: true })
-      .jpeg({ quality, mozjpeg: false })
-      .toFile(dest);
-    return { size: info.size, width: info.width, height: info.height };
+  async encodeToFit({ src, dest, steps, maxBytes }: EncodeRequest): Promise<EncodeResult> {
+    let raw;
+    try {
+      raw = await sharp(src).rotate().raw().toBuffer({ resolveWithObject: true });
+    } catch {
+      return { kind: 'unreadable' };
+    }
+    const { width, height, channels } = raw.info;
+    const decoded = sharp(raw.data, { raw: { width, height, channels } });
+    for (const { maxEdge, quality } of steps) {
+      const { data, info } = await decoded
+        .clone()
+        .resize({ width: maxEdge, height: maxEdge, fit: 'inside', withoutEnlargement: true })
+        .jpeg({ quality, mozjpeg: false })
+        .toBuffer({ resolveWithObject: true });
+      if (data.length > maxBytes) continue;
+      await fs.writeFile(dest, data);
+      return { kind: 'ok', size: data.length, width: info.width, height: info.height };
+    }
+    return { kind: 'too_large' };
   }
 }
 

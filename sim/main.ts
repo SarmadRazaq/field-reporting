@@ -76,7 +76,7 @@ function watch(outbox: Outbox) {
   let last = '';
   return outbox.subscribe(() => {
     const s = summarize(outbox.getSnapshot(), Date.now());
-    const line = `${s.title}${s.detail ? ` — ${s.detail}` : ''}${s.progress !== undefined ? ` (${Math.round(s.progress * 100)}%)` : ''}`;
+    const line = s.text;
     if (line !== last) say(`  ⟶ ${line}`);
     last = line;
   });
@@ -106,10 +106,10 @@ async function main() {
   ];
   const ids: string[] = [];
   for (const [description, files] of plan) {
-    const draft = await outbox.startDraft();
-    await outbox.setDescription(draft.id, description);
-    await outbox.addPhotos(draft.id, files);
-    const result = await outbox.submit(draft.id);
+    const draft = await outbox.drafts.start();
+    await outbox.drafts.setDescription(draft.id, description);
+    await outbox.drafts.addPhotos(draft.id, files);
+    const result = await outbox.drafts.submit(draft.id);
     if (!result.ok) throw new Error(result.issues.join());
     ids.push(draft.id);
   }

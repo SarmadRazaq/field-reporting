@@ -1,12 +1,15 @@
 import { ChunkSizer } from './chunking';
 import { deliver } from './deliver';
+import { Drafts, newImage } from './drafts';
 import { photoPaths } from './processing';
 import type { Clock, ContactStore, FileStore, HttpClient, ImageEncoder, Logger, ReportRepo } from './ports';
 import { NetworkError, systemClock } from './ports';
 import { ProtocolClient } from './protocol';
 import { BACKOFF, Cancelled, backoffMs, toFailure } from './retry';
-import { draftIssues, photoSlotsLeft, type DraftIssue } from './rules';
+import { ReportStore, imagePaths } from './store';
 import { PENDING_STATES, type Activity, type LocalReport, type OutboxSnapshot } from './types';
+
+export type { SubmitResult } from './drafts';
 
 export interface OutboxDeps {
   repo: ReportRepo;
@@ -23,18 +26,18 @@ export interface OutboxDeps {
 /** How often "the server answered" is written to disk at most. */
 const CONTACT_SAVE_MS = 10_000;
 
-export type SubmitResult = { ok: true } | { ok: false; issues: DraftIssue[] };
-
 /**
- * The single owner of local reports. The UI calls commands and subscribes to
- * snapshots; the uploader runs inside. Works without React or any screen.
+ * The reports on this phone and the uploader that sends them. The UI calls
+ * commands and subscribes to snapshots; works without React or any screen.
+ * Composing lives in `drafts`; everything after Save lives here.
  *
  * One drain runs at a time and delivers reports one at a time, oldest first
  * unless the inspector asked for one to go first: on 2G, parallel uploads only
  * make every report slower.
  */
 export class Outbox {
-  private reports = new Map<string, LocalReport>();
+  readonly drafts: Drafts;
+  private readonly store: ReportStore;
   private snapshot: OutboxSnapshot = { ready: false, reports: [], activity: null, lastContactAt: null };
   private listeners = new Set<() => void>();
   private activity: Activity | null = null;
@@ -44,8 +47,6 @@ export class Outbox {
   private wakeTimer: unknown = null;
   /** Aborts the requests of the current drain: for reset, stop, and "send this first". */
   private run: AbortController | null = null;
-  /** Bumped by reset and stop; any write from an older epoch is refused. */
-  private epoch = 0;
   /** Last word from the OS. Only stretches backoff; never stops an attempt. */
   private online = true;
   private lastContactAt: number | null;
@@ -61,6 +62,16 @@ export class Outbox {
     this.random = deps.random ?? Math.random;
     this.log = deps.log ?? (() => {});
     this.lastContactAt = deps.contact?.get() ?? null;
+    this.store = new ReportStore(deps.repo, deps.files, () => this.emit());
+    this.drafts = new Drafts({
+      store: this.store,
+      files: deps.files,
+      encoder: deps.encoder,
+      newId: deps.newId,
+      clock: this.clock,
+      log: this.log,
+      submitted: () => this.kick('submit'),
+    });
     // Any HTTP answer, even an error status, proves the server is reachable.
     this.http = {
       send: async req => {
@@ -75,9 +86,10 @@ export class Outbox {
 
   async start(): Promise<void> {
     if (this.snapshot.ready) return;
-    for (const report of await this.deps.repo.load()) this.reports.set(report.id, report);
+    await this.store.load();
     await this.removeOrphanFiles();
     this.emit(true);
+    this.drafts.resume();
     this.kick('start');
   }
 
@@ -122,9 +134,9 @@ export class Outbox {
    * this one starts straight away.
    */
   async sendFirst(id: string): Promise<void> {
-    const r = this.reports.get(id);
+    const r = this.store.get(id);
     if (!r || !PENDING_STATES.includes(r.state)) return;
-    await this.write({ ...r, sendFirstAt: this.clock.now(), nextAttemptAt: null });
+    await this.store.write({ ...r, sendFirstAt: this.clock.now(), nextAttemptAt: null });
     if (this.running && this.activity?.reportId !== id) {
       this.log(`[outbox] ${id} goes first; pausing ${this.activity?.reportId ?? 'current work'}`);
       this.run?.abort();
@@ -134,8 +146,8 @@ export class Outbox {
 
   /** Forget backoff timers and try every pending report now. */
   retryNow(reason: string): void {
-    for (const r of this.reports.values()) {
-      if (PENDING_STATES.includes(r.state) && r.nextAttemptAt !== null) this.reports.set(r.id, { ...r, nextAttemptAt: null });
+    for (const r of this.store.all()) {
+      if (PENDING_STATES.includes(r.state) && r.nextAttemptAt !== null) this.store.patch({ ...r, nextAttemptAt: null });
     }
     this.kick(reason);
   }
@@ -147,105 +159,20 @@ export class Outbox {
 
   /** True if any submitted report is not yet on the server. */
   hasPendingWork(): boolean {
-    return [...this.reports.values()].some(r => PENDING_STATES.includes(r.state));
-  }
-
-  // ── Drafts ─────────────────────────────────────────────────────────────────
-
-  currentDraft(): LocalReport | undefined {
-    return [...this.reports.values()].find(r => r.state === 'draft');
-  }
-
-  async startDraft(): Promise<LocalReport> {
-    const existing = this.currentDraft();
-    if (existing) return existing;
-    return this.write({
-      id: this.deps.newId(),
-      description: '',
-      createdAt: null,
-      updatedAt: this.clock.now(),
-      state: 'draft',
-      images: [],
-      attempts: 0,
-      nextAttemptAt: null,
-      lastIssue: null,
-      problem: null,
-      uploadedAt: null,
-    });
-  }
-
-  async setDescription(draftId: string, description: string): Promise<void> {
-    const draft = this.draft(draftId);
-    if (draft.description === description) return;
-    await this.write({ ...draft, description, updatedAt: this.clock.now() });
-  }
-
-  /**
-   * Copy picked photos into app storage straight away: picker URIs and caches
-   * do not survive a kill. Extra photos beyond the limit are ignored, and the
-   * number actually added is returned.
-   */
-  async addPhotos(draftId: string, uris: string[]): Promise<number> {
-    let added = 0;
-    for (const uri of uris) {
-      const draft = this.draft(draftId);
-      if (photoSlotsLeft(draft) === 0) break;
-      const id = this.deps.newId();
-      const dest = photoPaths(this.deps.files.photosDir, id).source;
-      const { bytes } = await this.deps.files.importPhoto(uri, dest);
-      await this.write({
-        ...this.draft(draftId),
-        updatedAt: this.clock.now(),
-        images: [
-          ...this.draft(draftId).images,
-          { id, sourcePath: dest, sourceBytes: bytes, processed: null, processingAttempts: 0, uploadedBytes: 0 },
-        ],
-      });
-      added += 1;
-    }
-    return added;
-  }
-
-  async removePhoto(draftId: string, imageId: string): Promise<void> {
-    const draft = this.draft(draftId);
-    const image = draft.images.find(i => i.id === imageId);
-    if (!image) return;
-    await this.write({ ...draft, updatedAt: this.clock.now(), images: draft.images.filter(i => i.id !== imageId) });
-    if (image.sourcePath) await this.deps.files.remove(image.sourcePath);
-  }
-
-  /** Saves the report on the phone and queues it. Says nothing about the network. */
-  async submit(draftId: string): Promise<SubmitResult> {
-    const draft = this.draft(draftId);
-    const issues = draftIssues(draft);
-    if (issues.length) return { ok: false, issues };
-    const now = this.clock.now();
-    await this.write({
-      ...draft,
-      description: draft.description.trim(),
-      state: 'queued',
-      createdAt: new Date(now).toISOString(),
-      updatedAt: now,
-    });
-    this.kick('submit');
-    return { ok: true };
-  }
-
-  async discardDraft(draftId: string): Promise<void> {
-    await this.discard(this.draft(draftId));
+    return this.store.all().some(r => PENDING_STATES.includes(r.state));
   }
 
   // ── Reports that need the user ─────────────────────────────────────────────
 
   /** Try a refused report again (e.g. after the server was fixed). */
   async retryReport(id: string): Promise<void> {
-    const r = this.reports.get(id);
+    const r = this.store.get(id);
     if (r?.state !== 'needs_attention') return;
     const reprocess = r.problem?.code === 'photo_unreadable';
-    await this.write({
+    await this.store.write({
       ...r,
       state: r.images.every(i => i.processed) ? 'uploading' : 'queued',
-      images: reprocess ? r.images.map(i => ({ ...i, processingAttempts: 0 })) : r.images,
+      images: reprocess ? r.images.map(i => ({ ...i, processingAttempts: 0, problem: null })) : r.images,
       problem: null,
       attempts: 0,
       nextAttemptAt: null,
@@ -254,35 +181,66 @@ export class Outbox {
     this.kick('retry');
   }
 
+  /**
+   * Swap one photo of a refused report for a new one, keeping the description
+   * and the other photos. The server may already hold this report's manifest,
+   * which can't change, so the report goes again under new ids; the other
+   * photos keep the files already prepared for them. Returns the new id.
+   */
+  async replacePhoto(id: string, imageId: string, uri: string): Promise<string | null> {
+    const r = this.store.get(id);
+    if (r?.state !== 'needs_attention' || !r.images.some(i => i.id === imageId)) return null;
+    const freshId = this.deps.newId();
+    const dest = photoPaths(this.deps.files.photosDir, freshId).source;
+    const { bytes } = await this.deps.files.importPhoto(uri, dest);
+    const replacement = await this.store.write({
+      ...r,
+      id: this.deps.newId(),
+      state: 'queued',
+      images: r.images.map(i =>
+        i.id === imageId ? newImage(freshId, dest, bytes) : { ...i, id: this.deps.newId(), uploadedBytes: 0 },
+      ),
+      updatedAt: this.clock.now(),
+      problem: null,
+      attempts: 0,
+      nextAttemptAt: null,
+      lastIssue: null,
+      sendFirstAt: null,
+    });
+    await this.store.discard(r, new Set(imagePaths(replacement)));
+    this.kick('photo replaced');
+    return replacement.id;
+  }
+
   /** Delete a refused report from the phone. */
   async discardReport(id: string): Promise<void> {
-    const r = this.reports.get(id);
+    const r = this.store.get(id);
     if (r?.state !== 'needs_attention') return;
-    await this.discard(r);
+    await this.store.discard(r);
   }
 
   /** Remove "uploaded" receipts from the list. They are already on the server. */
   async clearUploaded(): Promise<void> {
-    for (const r of [...this.reports.values()]) if (r.state === 'uploaded') await this.discard(r);
+    for (const r of this.store.all()) if (r.state === 'uploaded') await this.store.discard(r);
   }
 
   // ── Reset ──────────────────────────────────────────────────────────────────
 
   /**
-   * Wipe everything this outbox owns on the device. Stops the uploader first
-   * and bumps the epoch, so a reply that arrives late cannot write a report
-   * back after the wipe.
+   * Wipe everything this outbox owns on the device. Stops the uploader and
+   * photo preparation first and bumps the epoch, so a reply or a photo that
+   * finishes late cannot write a report back after the wipe.
    */
   async reset(): Promise<void> {
-    this.epoch += 1;
+    this.store.epoch += 1;
     this.run?.abort();
     this.clearWake();
     await this.idle();
+    await this.drafts.idle();
     this.rerun = false;
     this.lastContactAt = null;
-    await this.deps.repo.clear();
+    await this.store.clear();
     await this.deps.files.clearAll();
-    this.reports.clear();
     this.activity = null;
     this.emit();
     this.log('[outbox] reset');
@@ -293,7 +251,7 @@ export class Outbox {
    * Equivalent to the process dying, as far as the stored state is concerned.
    */
   async stop(): Promise<void> {
-    this.epoch += 1;
+    this.store.epoch += 1;
     this.run?.abort();
     this.clearWake();
     this.rerun = false;
@@ -303,10 +261,10 @@ export class Outbox {
   // ── Internals ──────────────────────────────────────────────────────────────
 
   private async drain(): Promise<void> {
-    const epoch = this.epoch;
+    const epoch = this.store.epoch;
     this.clearWake();
 
-    while (epoch === this.epoch) {
+    while (epoch === this.store.epoch) {
       const next = this.nextDue();
       if (!next) break;
       const run = new AbortController();
@@ -321,14 +279,14 @@ export class Outbox {
             clock: this.clock,
             chunks: this.chunks,
             log: this.log,
-            save: r => this.write(r, epoch),
+            save: r => this.store.write(r, epoch),
             progress: a => this.setActivity(a, epoch),
           },
           next,
         );
         this.log(`[outbox] ${next.id} uploaded`);
       } catch (e) {
-        if (epoch !== this.epoch || e instanceof Cancelled) return;
+        if (epoch !== this.store.epoch || e instanceof Cancelled) return;
         if (run.signal.aborted && e instanceof NetworkError && e.kind === 'aborted') {
           // Pre-empted by "send this first". Not a failure: progress is on disk, pick the next due report.
           this.setActivity(null, epoch);
@@ -342,19 +300,22 @@ export class Outbox {
           this.log(`[outbox] ${next.id} unexpected error: ${String(bug)}`);
           failure = { type: 'transient' as const, reason: 'server' as const, message: 'Unexpected error on this phone' };
         }
-        const current = this.reports.get(next.id) ?? next;
+        const current = this.store.get(next.id) ?? next;
         this.setActivity(null, epoch);
 
         if (failure.type === 'permanent') {
           this.log(`[outbox] ${next.id} needs attention: ${failure.problem.message}`);
-          await this.write({ ...current, state: 'needs_attention', problem: failure.problem, attempts: 0, nextAttemptAt: null }, epoch);
+          await this.store.write(
+            { ...current, state: 'needs_attention', problem: failure.problem, attempts: 0, nextAttemptAt: null },
+            epoch,
+          );
           continue;
         }
         const attempts = current.attempts + 1;
         const cap = this.online ? BACKOFF.maxMs : BACKOFF.offlineMaxMs;
         const wait = Math.max(backoffMs(attempts, this.random, cap), failure.type === 'transient' ? failure.retryAfterMs ?? 0 : 0);
         this.log(`[outbox] ${next.id} attempt ${attempts} failed (${failure.message}); retry in ${Math.round(wait / 1000)}s`);
-        await this.write(
+        await this.store.write(
           {
             ...current,
             attempts,
@@ -363,6 +324,7 @@ export class Outbox {
               reason: failure.type === 'transient' ? failure.reason : 'server',
               message: failure.message,
               at: this.clock.now(),
+              since: current.lastIssue?.since ?? this.clock.now(),
             },
           },
           epoch,
@@ -371,7 +333,7 @@ export class Outbox {
         break;
       }
     }
-    if (epoch === this.epoch) {
+    if (epoch === this.store.epoch) {
       this.setActivity(null, epoch);
       this.scheduleWake();
     }
@@ -384,7 +346,8 @@ export class Outbox {
 
   /** Upload order: reports asked to go first (in the order asked), then oldest first. */
   private pending(): LocalReport[] {
-    return [...this.reports.values()]
+    return this.store
+      .all()
       .filter(r => PENDING_STATES.includes(r.state))
       .sort(
         (a, b) =>
@@ -420,45 +383,14 @@ export class Outbox {
     this.wakeTimer = null;
   }
 
-  private draft(id: string): LocalReport {
-    const r = this.reports.get(id);
-    if (!r || r.state !== 'draft') throw new Error(`No draft ${id}`);
-    return r;
-  }
-
-  private async discard(r: LocalReport) {
-    await this.deps.repo.remove(r.id);
-    this.reports.delete(r.id);
-    this.emit();
-    for (const i of r.images) {
-      if (i.sourcePath) await this.deps.files.remove(i.sourcePath);
-      if (i.processed) await this.deps.files.remove(i.processed.path);
-    }
-  }
-
-  /** Persist first, then publish. Refuses writes from a run that a reset has replaced. */
-  private async write(report: LocalReport, epoch = this.epoch): Promise<LocalReport> {
-    if (epoch !== this.epoch) throw new Cancelled();
-    await this.deps.repo.save(report);
-    if (epoch !== this.epoch) throw new Cancelled();
-    this.reports.set(report.id, report);
-    this.emit();
-    return report;
-  }
-
   private setActivity(activity: Activity | null, epoch: number) {
-    if (epoch !== this.epoch) return;
+    if (epoch !== this.store.epoch) return;
     this.activity = activity;
     this.emit();
   }
 
   private async removeOrphanFiles() {
-    const referenced = new Set<string>();
-    for (const r of this.reports.values())
-      for (const i of r.images) {
-        if (i.sourcePath) referenced.add(i.sourcePath);
-        if (i.processed) referenced.add(i.processed.path);
-      }
+    const referenced = this.store.referencedPaths();
     for (const path of await this.deps.files.list(this.deps.files.photosDir))
       if (!referenced.has(path)) await this.deps.files.remove(path);
   }
@@ -466,7 +398,7 @@ export class Outbox {
   private emit(ready = this.snapshot.ready) {
     this.snapshot = {
       ready,
-      reports: [...this.reports.values()].sort((a, b) => (b.createdAt ?? '￿').localeCompare(a.createdAt ?? '￿')),
+      reports: this.store.all().sort((a, b) => (b.createdAt ?? '￿').localeCompare(a.createdAt ?? '￿')),
       activity: this.activity,
       lastContactAt: this.lastContactAt,
     };

@@ -19,30 +19,84 @@ const states = (w: World) => w.outbox.getSnapshot().reports.map(r => r.state);
 describe('composing', () => {
   it('refuses zero photos, a blank description, and a sixth photo', async () => {
     const w = await world();
-    const draft = await w.outbox.startDraft();
-    expect(await w.outbox.submit(draft.id)).toEqual({ ok: false, issues: ['no_photos', 'description_required'] });
+    const draft = await w.outbox.drafts.start();
+    expect(await w.outbox.drafts.submit(draft.id)).toEqual({ ok: false, issues: ['no_photos', 'description_required'] });
 
     const uris = Array.from({ length: 6 }, (_, i) => {
       w.files.gallery.set(`content://p${i}`, new Uint8Array(1000));
       return `content://p${i}`;
     });
-    expect(await w.outbox.addPhotos(draft.id, uris)).toBe(5);
-    await w.outbox.setDescription(draft.id, '   \n ');
-    expect(await w.outbox.submit(draft.id)).toEqual({ ok: false, issues: ['description_required'] });
+    expect(await w.outbox.drafts.addPhotos(draft.id, uris)).toBe(5);
+    await w.outbox.drafts.setDescription(draft.id, '   \n ');
+    expect(await w.outbox.drafts.submit(draft.id)).toEqual({ ok: false, issues: ['description_required'] });
   });
 
   it('keeps a draft, with its photos, across a force-quit', async () => {
     const w = await world();
     w.files.gallery.set('content://a', new Uint8Array(5000));
-    const draft = await w.outbox.startDraft();
-    await w.outbox.setDescription(draft.id, 'Half written');
-    await w.outbox.addPhotos(draft.id, ['content://a']);
+    const draft = await w.outbox.drafts.start();
+    await w.outbox.drafts.setDescription(draft.id, 'Half written');
+    await w.outbox.drafts.addPhotos(draft.id, ['content://a']);
     w.files.gallery.clear(); // the picker's copy is gone after the kill
 
     const outbox = await w.relaunch();
-    const restored = outbox.currentDraft()!;
+    const restored = outbox.drafts.current()!;
     expect(restored.description).toBe('Half written');
-    expect(await w.files.size(restored.images[0]!.sourcePath!)).toBe(5000);
+    const photo = restored.images[0]!;
+    expect(await w.files.size(photo.processed?.path ?? photo.sourcePath!)).not.toBeNull();
+  });
+
+  it('prepares photos as they are added, so Save has nothing left to do', async () => {
+    const w = await world();
+    w.server.offline = true;
+    w.files.gallery.set('content://a', new Uint8Array(18 * MB));
+    w.files.gallery.set('content://b', new Uint8Array(18 * MB));
+    const draft = await w.outbox.drafts.start();
+    await w.outbox.drafts.addPhotos(draft.id, ['content://a', 'content://b']);
+    await w.outbox.drafts.idle();
+
+    const images = w.outbox.drafts.current()!.images;
+    expect(images.every(i => i.processed && i.processed.size <= LIMITS.targetImageBytes)).toBe(true);
+    expect(images.every(i => i.sourcePath === null)).toBe(true); // originals dropped once prepared
+  });
+
+  it('finds an unreadable photo while composing, blocks Save until it is removed', async () => {
+    const w = await world();
+    w.files.gallery.set('content://good', new Uint8Array(MB));
+    w.files.gallery.set('content://bad', new Uint8Array(MB));
+    const draft = await w.outbox.drafts.start();
+    await w.outbox.drafts.setDescription(draft.id, 'Cracked beam');
+    await w.outbox.drafts.addPhotos(draft.id, ['content://good']);
+    await w.outbox.drafts.idle();
+    w.encoder.failAboveEdge = 0;
+    await w.outbox.drafts.addPhotos(draft.id, ['content://bad']);
+    await w.outbox.drafts.idle();
+
+    const bad = w.outbox.drafts.current()!.images[1]!;
+    expect(bad.problem).toMatchObject({ code: 'photo_unreadable', message: 'Photo 2 could not be read as an image' });
+    expect(await w.outbox.drafts.submit(draft.id)).toEqual({ ok: false, issues: ['photo_problem'] });
+    expect(w.server.requests).toHaveLength(0);
+
+    await w.outbox.drafts.removePhoto(draft.id, bad.id);
+    expect(await w.outbox.drafts.submit(draft.id)).toEqual({ ok: true });
+    await settle(w);
+    expect(w.server.committed()).toHaveLength(1);
+  });
+
+  it('gives up on a photo that keeps crashing the encoder while composing', async () => {
+    const w = await world();
+    w.files.gallery.set('content://a', new Uint8Array(MB));
+    const draft = await w.outbox.drafts.start();
+    w.encoder.hangAll = true;
+    await w.outbox.drafts.addPhotos(draft.id, ['content://a']);
+    for (let i = 0; i < 3; i++) {
+      await flush();
+      await w.relaunch(); // each launch tries it again, and "crashes"
+    }
+    w.encoder.hangAll = false;
+    await w.relaunch();
+    await w.outbox.drafts.idle();
+    expect(w.outbox.drafts.current()!.images[0]!.problem).toMatchObject({ code: 'photo_unreadable' });
   });
 });
 
@@ -76,20 +130,20 @@ describe('delivery', () => {
     expect(w.encoder.calls.map(c => c.maxEdge)).toEqual([4096, 4096, 3072]);
   });
 
+  // Photo 1 is prepared while composing; photo 2 is still waiting when Save is tapped, so the uploader prepares it.
   it('marks a photo that cannot be decoded at all', async () => {
     const w = await world();
-    const id = await fileReport(w, [1 * MB]);
-    void id;
+    await fileReport(w, [1 * MB, 1 * MB]);
     w.encoder.failAboveEdge = 0;
     await settle(w);
     const [report] = w.outbox.getSnapshot().reports;
-    expect(report!.problem).toMatchObject({ code: 'photo_unreadable', message: 'Photo 1 could not be read as an image' });
+    expect(report!.problem).toMatchObject({ code: 'photo_unreadable', message: 'Photo 2 could not be read as an image' });
   });
 
   it('gives up on a photo nothing can shrink, before any byte goes out', async () => {
     const w = await world();
+    await fileReport(w, [1 * MB, 40 * MB]);
     w.encoder.sizeFor = () => 7 * MB;
-    await fileReport(w, [40 * MB]);
     await settle(w);
     expect(states(w)).toEqual(['needs_attention']);
     expect(w.server.requests).toHaveLength(0);
@@ -162,6 +216,51 @@ describe('delivery', () => {
     await w.outbox.retryReport(report!.id);
     await settle(w);
     expect(w.server.committed()).toHaveLength(1);
+  });
+
+  it('replaces one refused photo and sends the report again, keeping the others', async () => {
+    const w = await world();
+    w.server.inject('commit', { kind: 'status', status: 422 }); // the server held the manifest, then refused
+    await fileReport(w, [1 * MB, 1 * MB], 'Corroded flange');
+    await settle(w);
+    const [refused] = w.outbox.getSnapshot().reports;
+    expect(refused!.state).toBe('needs_attention');
+    const kept = refused!.images[0]!.processed!.sha256;
+
+    w.files.gallery.set('content://retake', new Uint8Array(2 * MB));
+    const newId = await w.outbox.replacePhoto(refused!.id, refused!.images[1]!.id, 'content://retake');
+    await settle(w);
+
+    expect(newId).not.toBe(refused!.id);
+    expect(states(w)).toEqual(['uploaded']);
+    const [sent] = w.server.committed();
+    expect(sent!.id).toBe(newId);
+    expect(sent!.description).toBe('Corroded flange');
+    expect(sent!.images.map(i => i.sha256)[0]).toBe(kept); // the good photo wasn't redone
+    expectIntact(w);
+    expect(w.files.files.size).toBe(0);
+  });
+
+  it('calls out a server that has been failing for half an hour, and keeps trying', async () => {
+    const w = await world();
+    w.server.inject('any', { kind: 'status', status: 500 }, 1000);
+    await fileReport(w, [1 * MB]);
+    await settle(w, 10);
+    const early = w.outbox.getSnapshot();
+    expect(describeReport(early.reports[0]!, null, w.clock.now()).kind).toBe('waiting');
+    expect(summarize(early, w.clock.now()).kind).toBe('waiting');
+
+    await settle(w, 40); // 60 s apart at most: well past 30 minutes
+    const late = w.outbox.getSnapshot();
+    expect(describeReport(late.reports[0]!, null, w.clock.now())).toMatchObject({
+      kind: 'stuck',
+      label: 'Server not accepting reports',
+    });
+    expect(summarize(late, w.clock.now()).kind).toBe('stuck');
+
+    w.server.clearFaults();
+    await settle(w);
+    expect(states(w)).toEqual(['uploaded']);
   });
 
   it('re-sends a photo that arrived corrupted', async () => {
@@ -277,11 +376,11 @@ describe('force-quit', () => {
 
   it('gives up on a photo that keeps crashing the encoder instead of crash-looping', async () => {
     const w = await world();
-    const id = await fileReport(w, [10 * MB]);
-    void id;
+    // Photo 2 is still unprepared at Save, so it is the uploader that keeps crashing on it.
+    await fileReport(w, [1 * MB, 10 * MB]);
     for (let i = 0; i < 3; i++) {
       const [report] = await w.repo.load();
-      w.encoder.hangOn.add(report!.images[0]!.sourcePath!);
+      w.encoder.hangOn.add(report!.images[1]!.sourcePath!);
       await w.relaunch();
       await flush();
     }
@@ -299,9 +398,9 @@ describe('reset', () => {
     w.server.inject('chunk', { kind: 'freeze' });
     await flush();
     await flush();
-    const draft = await w.outbox.startDraft();
+    const draft = await w.outbox.drafts.start();
     w.files.gallery.set('content://x', new Uint8Array(100));
-    await w.outbox.addPhotos(draft.id, ['content://x']);
+    await w.outbox.drafts.addPhotos(draft.id, ['content://x']);
 
     await w.outbox.reset();
     await settle(w);

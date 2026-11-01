@@ -3,6 +3,8 @@ import {
   NetworkError,
   type Clock,
   type EncodeRequest,
+  type EncodeResult,
+  type EncodeStep,
   type FileStore,
   type HttpClient,
   type HttpRequest,
@@ -11,18 +13,19 @@ import {
   type ReportRepo,
 } from '../ports';
 import { Outbox } from '../outbox';
+import { parseReport, serializeReport } from '../schema';
 import type { LocalReport } from '../types';
 
 export const sha = (b: Uint8Array) => createHash('sha256').update(b).digest('hex');
 
-/** Repo that round-trips through JSON, like the real one, so shared references can't hide bugs. */
+/** Repo that round-trips through the stored form, like the real one, so shared references can't hide bugs. */
 export class MemoryRepo implements ReportRepo {
   rows = new Map<string, string>();
   async load() {
-    return [...this.rows.values()].map(v => JSON.parse(v) as LocalReport);
+    return [...this.rows.values()].map(parseReport);
   }
   async save(r: LocalReport) {
-    this.rows.set(r.id, JSON.stringify(r));
+    this.rows.set(r.id, serializeReport(r));
   }
   async remove(id: string) {
     this.rows.delete(id);
@@ -69,29 +72,36 @@ export class MemoryFiles implements FileStore {
   }
 }
 
-/** Pretends to encode: output size shrinks with edge and quality. */
+type StepCall = EncodeStep & { src: string };
+
+/** Pretends to encode: output size shrinks with edge and quality. Records each step it tries. */
 export class FakeEncoder implements ImageEncoder {
-  calls: EncodeRequest[] = [];
+  calls: StepCall[] = [];
   /** Set to make encodes for a source never finish (simulates a kill mid-processing). */
   hangOn = new Set<string>();
-  failOn = new Set<string>();
-  /** Encodes with a long edge above this throw, like an out-of-memory decode. */
+  /** Every encode hangs, whatever the source. */
+  hangAll = false;
+  /** Steps with a long edge above this fail to decode, like running out of memory. */
   failAboveEdge = Infinity;
-  sizeFor = (sourceBytes: number, req: EncodeRequest) =>
-    Math.round(sourceBytes * (req.maxEdge / 6000) ** 2 * (req.quality / 100) * 0.5);
+  sizeFor = (sourceBytes: number, step: EncodeStep) =>
+    Math.round(sourceBytes * (step.maxEdge / 6000) ** 2 * (step.quality / 100) * 0.5);
   constructor(private readonly files: MemoryFiles) {}
-  async encodeJpeg(req: EncodeRequest) {
-    this.calls.push(req);
-    if (this.hangOn.has(req.src)) await new Promise(() => {});
-    if (this.failOn.has(req.src)) throw new Error('decode failed');
-    if (req.maxEdge > this.failAboveEdge) throw new Error('OutOfMemoryError');
+  async encodeToFit(req: EncodeRequest): Promise<EncodeResult> {
+    if (this.hangAll || this.hangOn.has(req.src)) await new Promise(() => {});
     const src = this.files.files.get(req.src);
-    if (!src) throw new Error('no source');
-    const size = Math.max(1, this.sizeFor(src.length, req));
-    const out = new Uint8Array(size);
-    for (let i = 0; i < size; i++) out[i] = (i * 31 + src[i % src.length]!) & 0xff;
-    this.files.files.set(req.dest, out);
-    return { size, width: req.maxEdge, height: Math.round(req.maxEdge * 0.75) };
+    let decoded = false;
+    for (const step of req.steps) {
+      this.calls.push({ src: req.src, ...step });
+      if (!src || step.maxEdge > this.failAboveEdge) continue;
+      decoded = true;
+      const size = Math.max(1, this.sizeFor(src.length, step));
+      if (size > req.maxBytes) continue;
+      const out = new Uint8Array(size);
+      for (let i = 0; i < size; i++) out[i] = (i * 31 + src[i % src.length]!) & 0xff;
+      this.files.files.set(req.dest, out);
+      return { kind: 'ok', size, width: step.maxEdge, height: Math.round(step.maxEdge * 0.75) };
+    }
+    return { kind: decoded ? 'too_large' : 'unreadable' };
   }
 }
 
@@ -324,10 +334,10 @@ export async function fileReport(w: World, photoBytes: number[], description = '
     w.files.gallery.set(uri, bytes);
     return uri;
   });
-  const draft = await w.outbox.startDraft();
-  await w.outbox.setDescription(draft.id, description);
-  await w.outbox.addPhotos(draft.id, uris);
-  const result = await w.outbox.submit(draft.id);
+  const draft = await w.outbox.drafts.start();
+  await w.outbox.drafts.setDescription(draft.id, description);
+  await w.outbox.drafts.addPhotos(draft.id, uris);
+  const result = await w.outbox.drafts.submit(draft.id);
   if (!result.ok) throw new Error(`submit failed: ${result.issues.join(',')}`);
   return draft.id;
 }

@@ -1,4 +1,4 @@
-import { PENDING_STATES, type Activity, type LocalReport, type OutboxSnapshot } from './types';
+import { PENDING_STATES, type Activity, type LocalReport, type OutboxSnapshot, type TransientReason } from './types';
 
 /**
  * What to tell the user. Kept out of the UI so the wording rules are testable:
@@ -7,7 +7,16 @@ import { PENDING_STATES, type Activity, type LocalReport, type OutboxSnapshot } 
  */
 
 /** One per report state; each maps to one chip colour and icon. */
-export type StatusKind = 'draft' | 'saved' | 'waiting' | 'sending' | 'sent' | 'refused';
+export type StatusKind = 'draft' | 'saved' | 'waiting' | 'stuck' | 'sending' | 'sent' | 'refused';
+
+/**
+ * After this long of server-side failures in a row, a waiting report is
+ * called out as stuck: it still retries on its own, but someone should look
+ * at the server.
+ */
+export const STUCK_AFTER_MS = 30 * 60 * 1000;
+
+const SERVER_REASONS: readonly TransientReason[] = ['server', 'busy', 'rate_limited'];
 
 export interface ReportStatus {
   kind: StatusKind;
@@ -54,7 +63,14 @@ export function describeReport(r: LocalReport, activity: Activity | null, now: n
     };
   if (r.lastIssue && r.nextAttemptAt !== null) {
     const retryInMs = Math.max(0, r.nextAttemptAt - now);
-    const serverSide = r.lastIssue.reason === 'server' || r.lastIssue.reason === 'busy' || r.lastIssue.reason === 'rate_limited';
+    const serverSide = SERVER_REASONS.includes(r.lastIssue.reason);
+    if (serverSide && now - r.lastIssue.since >= STUCK_AFTER_MS)
+      return {
+        kind: 'stuck',
+        label: 'Server not accepting reports',
+        detail: `Failing since ${clockTime(new Date(r.lastIssue.since).toISOString())}: ${r.lastIssue.message}. Still saved on this phone and still trying`,
+        retryInMs,
+      };
     return {
       kind: 'waiting',
       label: serverSide ? 'Server busy' : 'Waiting for signal',
@@ -65,7 +81,7 @@ export function describeReport(r: LocalReport, activity: Activity | null, now: n
   return { kind: 'saved', label: 'Saved on this phone', detail: 'Safe even if the app closes' };
 }
 
-export type SummaryKind = 'empty' | 'all-sent' | 'sending' | 'waiting' | 'attention';
+export type SummaryKind = 'empty' | 'all-sent' | 'sending' | 'waiting' | 'stuck' | 'attention';
 
 /** The one connection summary at the top of Reports. */
 export interface Summary {
@@ -83,10 +99,11 @@ export function summarize(snapshot: OutboxSnapshot, now: number): Summary {
   if (refused.length) return { kind: 'attention', text: refused.length === 1 ? "1 report couldn't send" : `${refused.length} reports couldn't send` };
   if (pending.length) {
     if (snapshot.activity) return { kind: 'sending', text: `Sending · ${count}` };
-    const noSignal = pending.some(r => {
-      const s = describeReport(r, null, now);
-      return s.kind === 'waiting' && s.label === 'Waiting for signal';
-    });
+    if (pending.some(r => describeReport(r, null, now).kind === 'stuck'))
+      return { kind: 'stuck', text: `Server not accepting reports · ${count}` };
+    const noSignal = pending.some(
+      r => r.lastIssue !== null && r.nextAttemptAt !== null && !SERVER_REASONS.includes(r.lastIssue.reason),
+    );
     return { kind: 'waiting', text: noSignal ? `No signal · ${count}` : `Waiting · ${count}` };
   }
   if (sent.length) return { kind: 'all-sent', text: 'Nothing waiting on this phone' };

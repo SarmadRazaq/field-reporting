@@ -51,6 +51,8 @@ export interface LocalImage {
   processingAttempts: number;
   /** Last offset the server confirmed. Display only; the server's answer is always the truth. */
   uploadedBytes: number;
+  /** Why this photo can't be used, found while composing so it can be retaken. */
+  problem: Problem | null;
 }
 
 export type ProblemCode =
@@ -78,6 +80,8 @@ export interface TransientIssue {
   reason: TransientReason;
   message: string;
   at: number;
+  /** First failure of the current run of failures; reset once bytes move again. */
+  since: number;
 }
 
 export interface LocalReport {

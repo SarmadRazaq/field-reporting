@@ -7,8 +7,6 @@ export const DIRS = {
   photos: `${fs.dirs.DocumentDir}/photos`,
   /** Byte ranges cut from photos for upload. */
   chunks: `${fs.dirs.CacheDir}/upload-chunks`,
-  /** Where the resizer writes before we move the result into place. */
-  encoder: `${fs.dirs.CacheDir}/encoder`,
 };
 
 const stripScheme = (uri: string) => uri.replace(/^file:\/\//, '');
@@ -54,7 +52,7 @@ export class BlobFileStore implements FileStore {
     return (await fs.ls(dir)).map(name => `${dir}/${name}`);
   }
 
-  /** Photos, chunk and encoder scratch, and anything the image picker left in the cache. */
+  /** Photos, upload chunks, and anything the image picker left in the cache. */
   async clearAll(): Promise<void> {
     if (await fs.exists(DIRS.photos)) await fs.unlink(DIRS.photos);
     for (const name of await fs.ls(fs.dirs.CacheDir).catch(() => [] as string[]))
