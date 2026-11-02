@@ -173,11 +173,11 @@ Three tabs: **Reports** (what's on the phone and where each stands), **Sent** (w
 
 While reports are waiting, the app runs a foreground service with a quiet "Sending reports" notification showing progress. That keeps the uploader alive after the inspector leaves the app. Android only allows starting it while the app is visible, so it starts as soon as there's work, and stops when the queue is empty.
 
-If Android kills the process anyway, WorkManager (through `react-native-background-fetch`) wakes a headless task about every 15 minutes when there's a network, which sends for up to 25 seconds.
+If Android kills the process anyway, WorkManager (through `react-native-background-fetch`) wakes a headless task about every 15 minutes when there's a network. Each wake-up sends until Android signals that its time is up (about 10 minutes), then stops the uploader cleanly, so no request is cut off mid-write; the next wake-up carries on from the server's byte count.
 
-The notification is local and ongoing, not a push notification; Android requires it for a foreground service. Notification permission is asked after the first save, when it means something. Android 15+ caps this kind of service at about six hours a day, after which the app falls back to the 15-minute wake-ups and to sending whenever it's opened.
+The notification is local and ongoing, not a push notification; Android requires it for a foreground service. Notification permission is asked after the first save, when it means something. Android 15+ caps this kind of service at about six hours a day. When Android stops it, the native service tells the app, which stops counting on it, carries on with the wake-ups, and starts the service again the next time the app is opened.
 
-**Battery saver (Doze).** When the phone sits still with the screen off, Android batches WorkManager wake-ups into maintenance windows that can be an hour or more apart, and battery saver can stop them entirely. The foreground service isn't affected while it runs. So the worst case for a report left on a phone in a drawer is "sends in the next window, or when the app is opened", never "lost".
+**Battery saver (Doze).** When the phone sits still with the screen off, Android batches WorkManager wake-ups into maintenance windows that can be an hour or more apart, and battery saver can stop them entirely. The foreground service isn't affected while it runs. **Settings → Background sending** says whether this applies to the app and offers **Let it send in battery saver**, which opens Android's own dialog to exempt it. That's the inspector's choice, not something the app does on its own. Without the exemption the worst case for a report left on a phone in a drawer is "sends in the next window, or when the app is opened", never "lost".
 
 ### Start over
 
@@ -186,6 +186,8 @@ Settings → **Start over** deletes, from this phone: unsent reports, the unfini
 **The server is kept by default.** A switch on the same sheet deletes the server's reports too, "for everyone", in red. If the phone is cleared but the server can't be reached, the app says so and offers to try the server again.
 
 A reply that arrives after the reset can't write a report back. If the app is killed halfway through a reset, it finishes the reset at the next launch, or at the next background wake-up if that comes first, before anything is sent.
+
+**A report already being confirmed.** One request can't be called back: a commit the server may be processing right now. Instead of aborting it and leaving the report's fate unknown, Start over lets that one request finish (for at most about 30 seconds; nothing new starts meanwhile) and then says where the report ended up. If the server confirmed it: "One report got there first… it stays on the server". If the server didn't answer in time: "One report may be on the server… check Sent". The sheet warns about this before you confirm. Any other upload in flight is cancelled at once and never reaches the server.
 
 ### Architecture
 

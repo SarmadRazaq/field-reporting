@@ -118,7 +118,9 @@ export type Fault =
   /** Flip bytes in the stored chunk (corruption in transit). */
   | { kind: 'corrupt' }
   /** Never answer and never time out: a killed process's last request. */
-  | { kind: 'freeze' };
+  | { kind: 'freeze' }
+  /** Arrives, then waits for the test to call release(); the server does the work only then. */
+  | { kind: 'hold' };
 
 interface ServerImage {
   id: string;
@@ -166,6 +168,18 @@ export class FakeServer implements HttpClient {
     return f.fault;
   }
 
+  private held: (() => void)[] = [];
+
+  /** Let every held request through. */
+  release() {
+    for (const resolve of this.held.splice(0)) resolve();
+  }
+
+  /** How many requests are being held right now. */
+  holding() {
+    return this.held.length;
+  }
+
   async send(req: HttpRequest): Promise<HttpResponse> {
     if (req.signal.aborted) throw new NetworkError('aborted', 'aborted');
     const route: Route =
@@ -177,6 +191,10 @@ export class FakeServer implements HttpClient {
     const fault = this.takeFault(route);
     if (fault?.kind === 'offline') throw new NetworkError('offline', 'Network request failed');
     if (fault?.kind === 'timeout') throw new NetworkError('timeout', 'timed out');
+    if (fault?.kind === 'hold') {
+      await new Promise<void>(resolve => this.held.push(resolve));
+      if (req.signal.aborted) throw new NetworkError('aborted', 'aborted');
+    }
     if (fault?.kind === 'freeze')
       return new Promise((_, reject) =>
         req.signal.addEventListener('abort', () => reject(new NetworkError('aborted', 'aborted'))),

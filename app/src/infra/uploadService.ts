@@ -1,13 +1,18 @@
-import { NativeModules, Platform } from 'react-native';
+import { NativeEventEmitter, NativeModules, Platform } from 'react-native';
 
 interface UploadServiceNative {
   start(title: string, text: string, percent: number): Promise<boolean>;
   update(title: string, text: string, percent: number): void;
   stop(): void;
   isRunning(): Promise<boolean>;
+  isIgnoringBatteryOptimizations(): Promise<boolean>;
+  requestIgnoreBatteryOptimizations(): void;
+  addListener(eventName: string): void;
+  removeListeners(count: number): void;
 }
 
 const native: UploadServiceNative | undefined = Platform.OS === 'android' ? NativeModules.UploadService : undefined;
+const events = native ? new NativeEventEmitter(native) : null;
 
 /**
  * The Android foreground service that keeps uploads running in the
@@ -18,4 +23,17 @@ export const uploadService = {
   start: (title: string, text: string, percent = -1) => native?.start(title, text, percent) ?? Promise.resolve(false),
   update: (title: string, text: string, percent = -1) => native?.update(title, text, percent),
   stop: () => native?.stop(),
+  /** Called when Android, not the app, stops the service (the daily time cap on Android 15+). */
+  onStoppedByAndroid(listener: (reason: string) => void): () => void {
+    const sub = events?.addListener('UploadServiceStopped', (reason: unknown) => listener(String(reason)));
+    return () => sub?.remove();
+  },
+};
+
+/** Doze / app standby: while it applies, background wake-ups can be held back for an hour or more. */
+export const batteryOptimisation = {
+  /** True when the app is exempt; also true where the question doesn't apply. */
+  isExempt: () => native?.isIgnoringBatteryOptimizations() ?? Promise.resolve(true),
+  /** Opens the system dialog that lets the inspector exempt the app. */
+  requestExemption: () => native?.requestIgnoreBatteryOptimizations(),
 };

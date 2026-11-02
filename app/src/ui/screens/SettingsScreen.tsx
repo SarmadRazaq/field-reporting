@@ -3,12 +3,13 @@ import { useState } from 'react';
 import { ScrollView, StyleSheet, Switch, Text, TextInput, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { PENDING_STATES } from '../../core/types';
-import { startOver, deleteServerReports, type ResetResult } from '../../infra/reset';
+import { startOver, deleteServerReports, type ResetResult, type ServerResult } from '../../infra/reset';
 import { pingServer } from '../../infra/serverApi';
 import { DEFAULT_SERVER_URL, getServerUrl, setServerUrl } from '../../infra/settings';
 import { Button } from '../components/Button';
 import { Notice } from '../components/Notice';
 import { Sheet } from '../components/Sheet';
+import { useBatteryExemption } from '../hooks/useBatteryExemption';
 import { useOutbox, useOutboxCommands } from '../hooks/useOutbox';
 import type { TabScreenProps } from '../navigation/types';
 import { color, radius, space, type } from '../theme';
@@ -20,16 +21,19 @@ export function SettingsScreen(_: TabScreenProps<'Settings'>) {
   const snapshot = useOutbox();
   const box = useOutboxCommands();
   const queryClient = useQueryClient();
+  const battery = useBatteryExemption();
   const [url, setUrl] = useState(getServerUrl);
   const [check, setCheck] = useState<Check>({ state: 'idle' });
   const [sheet, setSheet] = useState(false);
   const [alsoServer, setAlsoServer] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<ResetResult | null>(null);
+  const [result, setResult] = useState<ResetResult | ServerResult | null>(null);
 
   const waiting = snapshot.reports.filter(r => PENDING_STATES.includes(r.state) || r.state === 'needs_attention').length;
   const sentReceipts = snapshot.reports.filter(r => r.state === 'uploaded').length;
   const draft = snapshot.reports.some(r => r.state === 'draft');
+  // A commit already sent can't be called back; Start over waits for its answer.
+  const confirming = snapshot.activity?.stage === 'committing';
 
   async function saveAndCheck() {
     setServerUrl(url);
@@ -99,6 +103,23 @@ export function SettingsScreen(_: TabScreenProps<'Settings'>) {
           ) : null}
         </Section>
 
+        <Section title="Background sending">
+          <Text style={[type.body, { color: color.soft }]}>
+            Reports keep sending after you leave the app, with a "Sending reports" notification while they do.
+          </Text>
+          {battery.exempt === false ? (
+            <>
+              <Text style={[type.body, { color: color.soft }]}>
+                When the phone is saving battery, Android can hold sending back for an hour or more. Nothing is lost; it is only
+                late.
+              </Text>
+              <Button label="Let it send in battery saver" variant="secondary" compact onPress={battery.request} />
+            </>
+          ) : battery.exempt ? (
+            <Text style={[type.caption, { color: color.muted }]}>Battery saver won't hold sending back.</Text>
+          ) : null}
+        </Section>
+
         <Section title="Start over">
           <Text style={[type.body, { color: color.soft }]}>
             Deletes everything this app keeps on this phone. You choose whether the server's reports go too.
@@ -118,6 +139,16 @@ export function SettingsScreen(_: TabScreenProps<'Settings'>) {
               {result.server === 'deleted' ? 'This phone and the server were cleared.' : 'This phone was cleared. The server keeps its reports.'}
             </Text>
           ) : null}
+          {result && 'inFlight' in result && result.inFlight.reachedServer.length ? (
+            <Notice tone="info" icon="cloudCheck" title="One report got there first">
+              {`"${result.inFlight.reachedServer.map(r => r.description).join('", "')}" was being confirmed when you started over, and the server confirmed it. It stays on the server; you can see it in Sent.`}
+            </Notice>
+          ) : null}
+          {result && 'inFlight' in result && result.inFlight.mayHaveReachedServer.length ? (
+            <Notice tone="amber" icon="warning" title="One report may be on the server">
+              {`"${result.inFlight.mayHaveReachedServer.map(r => r.description).join('", "')}" was being confirmed when you started over, and the server didn't answer in time. Check Sent to see whether it arrived.`}
+            </Notice>
+          ) : null}
         </Section>
       </ScrollView>
 
@@ -129,6 +160,9 @@ export function SettingsScreen(_: TabScreenProps<'Settings'>) {
               ? 'No unsent reports'
               : `${waiting} ${waiting === 1 ? 'report that has' : 'reports that have'} not reached the server. They will never be sent.`}
           </Bullet>
+          {confirming ? (
+            <Bullet>One report is being confirmed by the server right now. If the server confirms it first, it stays there.</Bullet>
+          ) : null}
           {draft ? <Bullet>Your unfinished report</Bullet> : null}
           <Bullet>All photos, receipts and settings</Bullet>
         </View>
@@ -147,7 +181,7 @@ export function SettingsScreen(_: TabScreenProps<'Settings'>) {
         <Text style={[type.caption, { color: alsoServer ? color.red700 : color.muted }]}>
           {alsoServer ? 'Reports on the server are deleted too, for everyone.' : 'Reports already on the server stay there.'}
         </Text>
-        <Button label={busy ? 'Deleting…' : 'Delete everything on this phone'} variant="destructive" onPress={confirmReset} disabled={busy} />
+        <Button label={busy ? (confirming ? 'Waiting for the server…' : 'Deleting…') : 'Delete everything on this phone'} variant="destructive" onPress={confirmReset} disabled={busy} />
         <Button label="Cancel" variant="secondary" onPress={() => setSheet(false)} disabled={busy} />
       </Sheet>
     </View>

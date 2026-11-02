@@ -43,8 +43,13 @@ class UploadForegroundService : Service() {
     return START_NOT_STICKY
   }
 
-  /** Android 15+ caps dataSync services at about six hours a day; stop cleanly when told. */
+  /**
+   * Android 15+ caps dataSync services at about six hours a day. Stop cleanly,
+   * and tell JS, so it stops counting on the service and falls back to the
+   * scheduled wake-ups until the app is next opened.
+   */
   override fun onTimeout(startId: Int, fgsType: Int) {
+    UploadServiceModule.serviceStopped("timeout")
     ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
     stopSelf()
   }

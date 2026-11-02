@@ -392,6 +392,56 @@ describe('force-quit', () => {
 });
 
 describe('reset', () => {
+  async function untilCommitHeld(w: World) {
+    for (let i = 0; i < 50 && w.server.holding() === 0; i++) await flush();
+    expect(w.server.holding()).toBe(1);
+  }
+
+  it('waits for a commit already sent, and says the report reached the server', async () => {
+    const w = await world();
+    w.server.inject('commit', { kind: 'hold' });
+    const id = await fileReport(w, [2 * MB], 'Mid-commit');
+    await untilCommitHeld(w);
+
+    const resetting = w.outbox.reset();
+    await flush();
+    w.server.release();
+    const outcome = await resetting;
+
+    expect(outcome).toEqual({ reachedServer: [{ id, description: 'Mid-commit' }], mayHaveReachedServer: [] });
+    expect(w.server.committed()).toHaveLength(1);
+    expect(w.repo.rows.size).toBe(0);
+    expect(w.files.files.size).toBe(0);
+  });
+
+  it('gives up waiting on a commit that never answers, and says it may have reached the server', async () => {
+    const w = await world();
+    w.server.inject('commit', { kind: 'freeze' });
+    const id = await fileReport(w, [2 * MB], 'Silent server');
+    for (let i = 0; i < 50 && w.outbox.getSnapshot().activity?.stage !== 'committing'; i++) await flush();
+
+    const resetting = w.outbox.reset();
+    await flush();
+    w.clock.fireNext(); // the wait runs out
+    const outcome = await resetting;
+
+    expect(outcome.mayHaveReachedServer).toEqual([{ id, description: 'Silent server' }]);
+    expect(outcome.reachedServer).toEqual([]);
+    expect(w.repo.rows.size).toBe(0);
+  });
+
+  it('does not wait when nothing is being committed', async () => {
+    const w = await world();
+    w.server.inject('chunk', { kind: 'freeze' });
+    await fileReport(w, [2 * MB]);
+    for (let i = 0; i < 10; i++) await flush();
+    expect(w.outbox.getSnapshot().activity?.stage).toBe('uploading');
+
+    expect(await w.outbox.reset()).toEqual({ reachedServer: [], mayHaveReachedServer: [] });
+    await settle(w);
+    expect(w.server.committed()).toHaveLength(0);
+  });
+
   it('wipes everything on the phone, and a late reply cannot bring it back', async () => {
     const w = await world();
     await fileReport(w, [3 * MB]);

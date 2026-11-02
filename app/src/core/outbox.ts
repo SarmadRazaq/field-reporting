@@ -4,7 +4,7 @@ import { Drafts, newImage } from './drafts';
 import { photoPaths } from './processing';
 import type { Clock, ContactStore, FileStore, HttpClient, ImageEncoder, Logger, ReportRepo } from './ports';
 import { NetworkError, systemClock } from './ports';
-import { ProtocolClient } from './protocol';
+import { ProtocolClient, TIMEOUTS } from './protocol';
 import { BACKOFF, Cancelled, backoffMs, toFailure } from './retry';
 import { ReportStore, imagePaths } from './store';
 import { PENDING_STATES, type Activity, type LocalReport, type OutboxSnapshot } from './types';
@@ -35,6 +35,17 @@ const CONTACT_SAVE_MS = 10_000;
  * unless the inspector asked for one to go first: on 2G, parallel uploads only
  * make every report slower.
  */
+/** Where reports that were mid-commit at the moment of a reset ended up. */
+export interface ResetOutcome {
+  /** The server confirmed the commit before the wipe: these are on the server. */
+  reachedServer: { id: string; description: string }[];
+  /** No answer came in time: these may or may not be on the server. */
+  mayHaveReachedServer: { id: string; description: string }[];
+}
+
+/** How long a reset waits for a commit already sent: a little over the commit's own timeout. */
+const COMMIT_SETTLE_MS = TIMEOUTS.controlMs + 2_000;
+
 export class Outbox {
   readonly drafts: Drafts;
   private readonly store: ReportStore;
@@ -44,6 +55,8 @@ export class Outbox {
 
   private running: Promise<void> | null = null;
   private rerun = false;
+  /** Set during a reset: no new report or step starts, but a commit already sent may still come back. */
+  private closing = false;
   private wakeTimer: unknown = null;
   /** Aborts the requests of the current drain: for reset, stop, and "send this first". */
   private run: AbortController | null = null;
@@ -102,7 +115,7 @@ export class Outbox {
 
   /** Something changed that may let work proceed (submit, app foregrounded, timer). */
   kick(reason: string): void {
-    if (!this.snapshot.ready) return;
+    if (!this.snapshot.ready || this.closing) return;
     if (this.running) {
       this.rerun = true;
       return;
@@ -230,8 +243,25 @@ export class Outbox {
    * Wipe everything this outbox owns on the device. Stops the uploader and
    * photo preparation first and bumps the epoch, so a reply or a photo that
    * finishes late cannot write a report back after the wipe.
+   *
+   * One thing can't be called back: a commit already sent. The server may be
+   * publishing that report right now. Rather than abort it and leave its fate
+   * unknown, reset lets that one request finish (for at most a little over its
+   * own timeout) and says where the report ended up.
    */
-  async reset(): Promise<void> {
+  async reset(): Promise<ResetOutcome> {
+    this.closing = true;
+    this.clearWake();
+    const outcome: ResetOutcome = { reachedServer: [], mayHaveReachedServer: [] };
+    const committing = this.activity?.stage === 'committing' ? this.store.get(this.activity.reportId) : undefined;
+    if (committing && this.running) {
+      this.log(`[outbox] reset waits for the commit of ${committing.id}`);
+      await this.within(this.idle(), COMMIT_SETTLE_MS);
+      const after = this.store.get(committing.id);
+      const entry = { id: committing.id, description: committing.description };
+      (after?.state === 'uploaded' ? outcome.reachedServer : outcome.mayHaveReachedServer).push(entry);
+    }
+
     this.store.epoch += 1;
     this.run?.abort();
     this.clearWake();
@@ -242,8 +272,10 @@ export class Outbox {
     await this.store.clear();
     await this.deps.files.clearAll();
     this.activity = null;
+    this.closing = false;
     this.emit();
     this.log('[outbox] reset');
+    return outcome;
   }
 
   /**
@@ -264,7 +296,7 @@ export class Outbox {
     const epoch = this.store.epoch;
     this.clearWake();
 
-    while (epoch === this.store.epoch) {
+    while (epoch === this.store.epoch && !this.closing) {
       const next = this.nextDue();
       if (!next) break;
       const run = new AbortController();
@@ -337,6 +369,17 @@ export class Outbox {
       this.setActivity(null, epoch);
       this.scheduleWake();
     }
+  }
+
+  /** Resolves when `p` settles or after `ms` on the outbox's clock, whichever is first. */
+  private within(p: Promise<unknown>, ms: number): Promise<void> {
+    return new Promise(resolve => {
+      const timer = this.clock.setTimeout(resolve, ms);
+      p.finally(() => {
+        this.clock.clearTimeout(timer);
+        resolve();
+      });
+    });
   }
 
   private nextDue(): LocalReport | undefined {
