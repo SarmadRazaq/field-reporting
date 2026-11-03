@@ -1,19 +1,24 @@
 import { AppState } from 'react-native';
 import BackgroundFetch from 'react-native-background-fetch';
+import { parseHandoffResults } from '../core/handoff';
 import { summarize } from '../core/status';
 import type { OutboxSnapshot } from '../core/types';
 import { PENDING_STATES } from '../core/types';
 import { outbox } from './outbox';
 import { finishInterruptedReset } from './reset';
+import { getServerUrl } from './settings';
 import { uploadService } from './uploadService';
 
 /**
  * Two layers keep reports moving when the inspector is not looking:
  *
  * 1. While work is waiting, a foreground service (with a "Sending reports"
- *    notification) keeps the process alive, so the uploader simply keeps
- *    running in the background. Android only lets us start it while the app
- *    is visible, so it starts as soon as there is work.
+ *    notification) keeps the process alive. Android only lets us start it
+ *    while the app is visible, so it starts as soon as there is work. When the
+ *    app leaves the screen, the outbox hands the reports to a native sender
+ *    (BackgroundSender.kt), because React Native pauses JS timers in the
+ *    background and every reply, retry and timeout of the JS uploader runs on
+ *    one. Coming back, the outbox takes them back with what was sent.
  * 2. If the OS kills the process, or stops the service (Android 15+ allows it
  *    about six hours a day), WorkManager (via background-fetch) wakes a JS
  *    task about every 15 minutes, only when there is a network. Each wake-up
@@ -38,6 +43,39 @@ const WAKE_UP_BUDGET_MS = 9 * 60_000;
 
 /** True while the foreground service is up; then it, not the wake-ups, keeps the uploader going. */
 let serviceOn = false;
+/** True while the native sender has the reports; it updates the notification itself. */
+let handedOff = false;
+/** Hand-off and take-back run one at a time, so a quick away-and-back can't leave both senders going. */
+let handoffQueue: Promise<void> = Promise.resolve();
+const serially = (step: () => Promise<void>) =>
+  (handoffQueue = handoffQueue.then(step).catch(e => console.warn('[background] hand-off', e)));
+
+/** The app left the screen: let native code send the reports that are ready. */
+function handOff(): Promise<void> {
+  return serially(async () => {
+    const box = outbox();
+    if (!serviceOn || handedOff || !box.hasPendingWork()) return;
+    const reports = box.pause();
+    if (!reports) return; // a reset is running
+    if (reports.length && (await uploadService.handOff(reports, getServerUrl()))) {
+      handedOff = true;
+      return;
+    }
+    await box.resume();
+  });
+}
+
+/**
+ * Stop the native sender and give the outbox what it did. Also used at
+ * launch, for results left by a sender whose process died.
+ */
+export function takeBack(): Promise<void> {
+  return serially(async () => {
+    const results = parseHandoffResults(await uploadService.takeBack());
+    handedOff = false;
+    await outbox().resume(results);
+  });
+}
 
 const pendingCount = (s: OutboxSnapshot) => s.reports.filter(r => PENDING_STATES.includes(r.state)).length;
 
@@ -80,7 +118,7 @@ export function startBackgroundWork(): () => void {
   // Android stopped the service (daily cap): stop counting on it; the wake-ups carry on,
   // and it's started again the next time the app is opened.
   const unsubscribeStopped = uploadService.onStoppedByAndroid(reason => {
-    console.log(`[background] service stopped by Android (${reason}); falling back to scheduled wake-ups`);
+    console.log(`[background] service stopped (${reason}); scheduled wake-ups carry on if anything is left`);
     serviceOn = false;
   });
 
@@ -98,7 +136,7 @@ export function startBackgroundWork(): () => void {
       if (AppState.currentState !== 'active') return; // Android refuses from the background; try again on return.
       const n = notificationText(s);
       serviceOn = await uploadService.start(n.title, n.text, n.percent);
-    } else if (waiting && serviceOn && Date.now() - lastNotify > NOTIFY_EVERY_MS) {
+    } else if (waiting && serviceOn && !handedOff && Date.now() - lastNotify > NOTIFY_EVERY_MS) {
       lastNotify = Date.now();
       const n = notificationText(s);
       uploadService.update(n.title, n.text, n.percent);
@@ -109,7 +147,10 @@ export function startBackgroundWork(): () => void {
   };
 
   const unsubscribe = box.subscribe(() => void sync());
-  const appState = AppState.addEventListener('change', next => next === 'active' && void sync());
+  const appState = AppState.addEventListener('change', next => {
+    if (next === 'background') void handOff();
+    if (next === 'active') void takeBack().then(sync);
+  });
   void sync();
   return () => {
     unsubscribe();
@@ -120,10 +161,14 @@ export function startBackgroundWork(): () => void {
 
 /** Run the uploader until the queue is empty or the wake-up's time is up: used by WorkManager wake-ups. */
 export async function sendForAWhile(): Promise<void> {
+  // The service is up and the native sender has the reports: nothing to add.
+  if (await uploadService.isSending()) return;
   const box = outbox();
   // A wake-up can come before the app is next opened; never send what an interrupted reset meant to wipe.
   await finishInterruptedReset();
+  box.pause();
   await box.start();
+  await takeBack();
   box.retryNow('background wake-up');
   await Promise.race([box.idle(), new Promise(r => setTimeout(r, WAKE_UP_BUDGET_MS))]);
 }

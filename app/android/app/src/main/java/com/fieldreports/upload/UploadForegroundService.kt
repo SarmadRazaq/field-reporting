@@ -15,10 +15,11 @@ import androidx.core.app.ServiceCompat
 import com.fieldreports.MainActivity
 
 /**
- * Keeps the process in the foreground while reports are waiting, so the JS
- * uploader keeps running after the inspector leaves the app. The service does
- * no work itself; it only holds the "Sending reports" notification that Android
- * requires for that. The JS side starts it, updates the text and stops it.
+ * Keeps the process in the foreground while reports are waiting, so the
+ * [BackgroundSender] can keep sending after the inspector leaves the app. The
+ * service does no work itself; it only holds the "Sending reports"
+ * notification that Android requires for that. The JS side starts it while the
+ * app is visible (Android refuses later) and stops it when nothing is waiting.
  */
 class UploadForegroundService : Service() {
 
@@ -26,6 +27,7 @@ class UploadForegroundService : Service() {
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     if (intent?.action == ACTION_STOP) {
+      Thread { BackgroundSender.stop() }.start()
       ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
       stopSelf()
       return START_NOT_STICKY
@@ -44,11 +46,12 @@ class UploadForegroundService : Service() {
   }
 
   /**
-   * Android 15+ caps dataSync services at about six hours a day. Stop cleanly,
-   * and tell JS, so it stops counting on the service and falls back to the
-   * scheduled wake-ups until the app is next opened.
+   * Android 15+ caps dataSync services at about six hours a day. Stop sending
+   * (what was sent is kept for the app to pick up) and tell JS, so it falls
+   * back to the scheduled wake-ups until the app is next opened.
    */
   override fun onTimeout(startId: Int, fgsType: Int) {
+    Thread { BackgroundSender.stop() }.start()
     UploadServiceModule.serviceStopped("timeout")
     ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
     stopSelf()

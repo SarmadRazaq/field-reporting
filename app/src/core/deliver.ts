@@ -161,23 +161,32 @@ async function uploadImages(ctx: DeliveryContext, report: LocalReport, offsets: 
 }
 
 async function markUploaded(ctx: DeliveryContext, r: LocalReport): Promise<LocalReport> {
-  const saved = await ctx.save({
+  const saved = await ctx.save(asUploaded(r, ctx.clock.now()));
+  ctx.progress(null);
+  await removeLocalPhotos(ctx.files, r);
+  return saved;
+}
+
+/** The report as it is once the server confirmed it at `at`. */
+export function asUploaded(r: LocalReport, at: number): LocalReport {
+  return {
     ...r,
     state: 'uploaded',
-    uploadedAt: new Date(ctx.clock.now()).toISOString(),
+    uploadedAt: new Date(at).toISOString(),
     attempts: 0,
     nextAttemptAt: null,
     lastIssue: null,
     problem: null,
     images: r.images.map(i => ({ ...i, uploadedBytes: i.processed?.size ?? i.uploadedBytes })),
-  });
-  ctx.progress(null);
-  // The server has the photos now; the local copies only take space.
+  };
+}
+
+/** The server has the photos now; the local copies only take space. */
+export async function removeLocalPhotos(files: FileStore, r: LocalReport): Promise<void> {
   for (const image of r.images) {
-    if (image.processed) await ctx.files.remove(image.processed.path);
-    if (image.sourcePath) await ctx.files.remove(image.sourcePath);
+    if (image.processed) await files.remove(image.processed.path);
+    if (image.sourcePath) await files.remove(image.sourcePath);
   }
-  return saved;
 }
 
 /** The link works again; stop showing the last failure while bytes are moving. */

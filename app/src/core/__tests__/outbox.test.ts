@@ -391,6 +391,86 @@ describe('force-quit', () => {
   });
 });
 
+describe('hand-off to the native sender', () => {
+  const mid = async (w: World) => {
+    for (let i = 0; i < 10; i++) await flush();
+    expect(w.outbox.getSnapshot().activity?.stage).toBe('uploading');
+  };
+
+  it('stops sending and hands over the ready reports, oldest first', async () => {
+    const w = await world();
+    w.server.inject('chunk', { kind: 'freeze' });
+    const first = await fileReport(w, [6 * MB], 'First');
+    const second = await fileReport(w, [2 * MB], 'Second');
+    await mid(w);
+
+    const handed = w.outbox.pause()!;
+    await settle(w);
+    const sent = w.server.requests.length;
+    w.outbox.retryNow('connectivity');
+    w.outbox.kick('submit');
+    await settle(w);
+
+    expect(handed.map(r => r.id)).toEqual([first, second]);
+    expect(handed[0]!.images[0]).toMatchObject({ size: expect.any(Number), sha256: expect.any(String) });
+    expect(w.server.requests.length).toBe(sent);
+    expect(w.clock.pendingTimers()).toBe(0);
+    expect(w.logs.some(l => l.includes('attempt'))).toBe(false);
+  });
+
+  it('applies what the native sender did, and leaves the rest to carry on', async () => {
+    const w = await world();
+    w.server.inject('chunk', { kind: 'freeze' });
+    const sent = await fileReport(w, [2 * MB], 'Sent in the background');
+    const refused = await fileReport(w, [2 * MB], 'Refused');
+    const partly = await fileReport(w, [2 * MB], 'Partly sent');
+    await mid(w);
+    const handed = w.outbox.pause()!;
+    const photo = handed.find(r => r.id === partly)!.images[0]!.id;
+
+    await w.outbox.resume([
+      { id: sent, kind: 'uploaded', at: Date.parse('2026-11-03T10:00:00Z') },
+      { id: refused, kind: 'needs_attention', problem: { code: 'too_large', message: 'Too large', status: 413 } },
+      { id: partly, kind: 'pending', uploadedBytes: { [photo]: 65_536 }, issue: null },
+      { id: 'not-on-this-phone', kind: 'uploaded', at: 0 },
+    ]);
+    const byId = (id: string) => w.outbox.getSnapshot().reports.find(r => r.id === id)!;
+    expect(byId(sent)).toMatchObject({ state: 'uploaded', uploadedAt: '2026-11-03T10:00:00.000Z' });
+    expect(byId(refused)).toMatchObject({ state: 'needs_attention', problem: { code: 'too_large' } });
+    expect(byId(partly).images[0]!.uploadedBytes).toBe(65_536);
+    // The background-sent report's photos are gone from the phone; the refused one keeps its own.
+    expect(w.files.files.size).toBe(2);
+
+    await settle(w);
+    expect(w.server.committed().map(r => r.id)).toEqual([partly]);
+    expect(byId(partly).state).toBe('uploaded');
+  });
+
+  it('carries on from the server\'s bytes when taken back with no news, and lands once', async () => {
+    const w = await world();
+    w.server.inject('chunk', { kind: 'drop', afterBytes: 10_000 });
+    await fileReport(w, [6 * MB]);
+    for (let i = 0; i < 30 && w.server.requests.filter(r => r.route === 'chunk').length < 3; i++) await flush();
+    w.outbox.pause();
+    await w.outbox.resume();
+    await settle(w);
+    expect(w.server.committed()).toHaveLength(1);
+    expect(w.server.committed()[0]!.commits).toBe(1);
+    expectIntact(w);
+  });
+
+  it('does not hand over during a reset', async () => {
+    const w = await world();
+    w.server.inject('commit', { kind: 'hold' });
+    await fileReport(w, [2 * MB]);
+    for (let i = 0; i < 50 && w.server.holding() === 0; i++) await flush();
+    const resetting = w.outbox.reset();
+    expect(w.outbox.pause()).toBeNull();
+    w.server.release();
+    await resetting;
+  });
+});
+
 describe('reset', () => {
   async function untilCommitHeld(w: World) {
     for (let i = 0; i < 50 && w.server.holding() === 0; i++) await flush();

@@ -1,6 +1,6 @@
 import NetInfo from '@react-native-community/netinfo';
 import { AppState } from 'react-native';
-import { startBackgroundWork } from './background';
+import { startBackgroundWork, takeBack } from './background';
 import { outbox } from './outbox';
 import { finishInterruptedReset } from './reset';
 
@@ -12,7 +12,12 @@ import { finishInterruptedReset } from './reset';
 export function startOutboxLifecycle(): () => void {
   const box = outbox();
   finishInterruptedReset()
-    .then(() => box.start())
+    .then(() => {
+      // Held until whatever a native sender did before this launch is applied (see takeBack).
+      box.pause();
+      return box.start();
+    })
+    .then(takeBack)
     .catch(e => console.error('[outbox] failed to start', e));
   const stopBackground = startBackgroundWork();
 

@@ -8,20 +8,19 @@ import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
 import androidx.core.content.ContextCompat
-import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
-import com.facebook.react.bridge.UiThreadUtil
-import com.facebook.react.jstasks.HeadlessJsTaskConfig
-import com.facebook.react.jstasks.HeadlessJsTaskContext
 
-/** JS control of [UploadForegroundService]: start while work is waiting, update its text, stop when done. */
+/**
+ * JS control of [UploadForegroundService] (start while work is waiting, update
+ * its text, stop when done) and of the [BackgroundSender] that sends while the
+ * app is in the background.
+ */
 class UploadServiceModule(private val context: ReactApplicationContext) : ReactContextBaseJavaModule(context) {
 
-  private var running = false
-  private var keepAliveTaskId: Int? = null
+  @Volatile private var running = false
 
   init {
     instance = this
@@ -45,7 +44,6 @@ class UploadServiceModule(private val context: ReactApplicationContext) : ReactC
     try {
       ContextCompat.startForegroundService(context, intent)
       running = true
-      startKeepAlive()
       promise.resolve(true)
     } catch (e: Exception) {
       // ForegroundServiceStartNotAllowedException (API 31+) and friends.
@@ -69,7 +67,6 @@ class UploadServiceModule(private val context: ReactApplicationContext) : ReactC
   fun stop() {
     if (!running) return
     running = false
-    stopKeepAlive()
     val intent = Intent(context, UploadForegroundService::class.java).apply { action = UploadForegroundService.ACTION_STOP }
     try {
       context.startService(intent)
@@ -81,6 +78,56 @@ class UploadServiceModule(private val context: ReactApplicationContext) : ReactC
 
   @ReactMethod
   fun isRunning(promise: Promise) = promise.resolve(running)
+
+  /**
+   * The app is leaving the foreground: send `reportsJson` natively from here on.
+   * Only while the service runs, since that is what keeps the process alive;
+   * resolves false (and sends nothing) otherwise, and JS keeps the reports.
+   */
+  @ReactMethod
+  fun handOff(reportsJson: String, baseUrl: String, promise: Promise) {
+    if (!running) return promise.resolve(false)
+    try {
+      BackgroundSender.start(context, reportsJson, baseUrl, senderListener)
+      promise.resolve(true)
+    } catch (e: Exception) {
+      Log.w(TAG, "hand-off refused", e)
+      promise.resolve(false)
+    }
+  }
+
+  /**
+   * Stops the native sender and returns what happened to each report it had
+   * (JSON, see src/core/handoff.ts), or null if there is nothing to apply.
+   * Also picks up results left by a sender whose process died.
+   */
+  @ReactMethod
+  fun takeBack(promise: Promise) {
+    Thread {
+      try {
+        BackgroundSender.stop()
+        promise.resolve(BackgroundSender.takeResults(context))
+      } catch (e: Exception) {
+        promise.reject("take_back_failed", e)
+      }
+    }.start()
+  }
+
+  @ReactMethod
+  fun isSending(promise: Promise) = promise.resolve(BackgroundSender.isSending)
+
+  private val senderListener = object : BackgroundSender.Listener {
+    override fun progress(title: String, text: String, percent: Int) = update(title, text, percent.toDouble())
+
+    override fun finished() {
+      stop()
+      emitStopped("done")
+    }
+  }
+
+  private fun emitStopped(reason: String) {
+    if (context.hasActiveReactInstance()) context.emitDeviceEvent(STOPPED_EVENT, reason)
+  }
 
   /**
    * Whether Android's battery optimisation (Doze, app standby) applies to this
@@ -107,27 +154,6 @@ class UploadServiceModule(private val context: ReactApplicationContext) : ReactC
     }
   }
 
-  /**
-   * React Native stops firing JS timers while the app is in the background,
-   * unless a headless JS task is running. fetch() hands back its result through
-   * a timer, and retries and timeouts are timers too, so without this the
-   * uploader would stall at the first fetch after the app is left. A task that
-   * lives exactly as long as the service keeps them running. The JS side
-   * registers it in index.js as a promise that never settles; it is finished here.
-   */
-  private fun startKeepAlive() = UiThreadUtil.runOnUiThread {
-    val tasks = HeadlessJsTaskContext.getInstance(context)
-    if (keepAliveTaskId?.let { tasks.isTaskRunning(it) } == true) return@runOnUiThread
-    keepAliveTaskId = tasks.startTask(HeadlessJsTaskConfig(KEEP_ALIVE_TASK, Arguments.createMap(), 0, true))
-  }
-
-  private fun stopKeepAlive() = UiThreadUtil.runOnUiThread {
-    val id = keepAliveTaskId ?: return@runOnUiThread
-    keepAliveTaskId = null
-    val tasks = HeadlessJsTaskContext.getInstance(context)
-    if (tasks.isTaskRunning(id)) tasks.finishTask(id)
-  }
-
   // Required by NativeEventEmitter on the JS side.
   @ReactMethod
   fun addListener(eventName: String) {}
@@ -137,7 +163,6 @@ class UploadServiceModule(private val context: ReactApplicationContext) : ReactC
 
   companion object {
     const val STOPPED_EVENT = "UploadServiceStopped"
-    const val KEEP_ALIVE_TASK = "FieldReportsKeepAlive"
     private const val TAG = "UploadService"
 
     @Volatile
@@ -147,8 +172,7 @@ class UploadServiceModule(private val context: ReactApplicationContext) : ReactC
     fun serviceStopped(reason: String) {
       val module = instance ?: return
       module.running = false
-      module.stopKeepAlive()
-      if (module.context.hasActiveReactInstance()) module.context.emitDeviceEvent(STOPPED_EVENT, reason)
+      module.emitStopped(reason)
     }
   }
 }

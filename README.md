@@ -171,13 +171,15 @@ Three tabs: **Reports** (what's on the phone and where each stands), **Sent** (w
 
 ### Background sending (Android)
 
-While reports are waiting, the app runs a foreground service with a quiet "Sending reports" notification showing progress. That keeps the uploader alive after the inspector leaves the app. Android only allows starting it while the app is visible, so it starts as soon as there's work, and stops when the queue is empty.
+While reports are waiting, the app runs a foreground service with a quiet "Sending reports" notification showing progress. That keeps the process alive after the inspector leaves the app. Android only allows starting it while the app is visible, so it starts as soon as there's work, and stops when the queue is empty.
 
-Keeping the process alive isn't enough on its own. React Native stops firing JS timers once the app is in the background, unless a headless JS task is running, and `fetch()` hands back its result through a timer, as do retries and timeouts. Without a fix, the photo bytes kept flowing in the background but the commit's reply was never processed, so a report could sit at "99%" until the app was opened again (found on the emulator). So while the service runs, the native module also holds a headless JS task open (`FieldReportsKeepAlive`), and finishes it when the service stops.
+**In the background, native code sends.** Keeping the process alive isn't enough on its own: React Native stops firing JS timers once the app is in the background, and `fetch()` hands back its result through a timer, as do retries and timeouts. On the emulator, photo bytes kept flowing but the commit's reply was never processed, so a report sat at "99%" until the app was opened again. So when the app leaves the screen, the outbox pauses and hands the reports whose photos are ready to a native sender (`BackgroundSender.kt`), which speaks the same protocol with the same rules: chunks sized to the link, the same retry table, backoff, and the 5 MB check before anything goes out. When the app comes back, the outbox takes the reports back and applies what was sent.
 
-If Android kills the process anyway, WorkManager (through `react-native-background-fetch`) wakes a headless task about every 15 minutes when there's a network. Each wake-up sends until Android signals that its time is up (about 10 minutes), then stops the uploader cleanly, so no request is cut off mid-write; the next wake-up carries on from the server's byte count.
+The native sender never writes the reports database (the database library bundles its own SQLite, and two copies of SQLite on one file in one process can corrupt it). It writes a small results file instead, which the app applies when it takes over, at launch too if the process died in between. The server stays the truth either way: if a result is lost, the next manifest the app sends is answered "committed", so nothing is sent twice. A report whose photos aren't prepared yet stays with the app until it's next opened or woken.
 
-The notification is local and ongoing, not a push notification; Android requires it for a foreground service. Notification permission is asked after the first save, when it means something. Android 15+ caps this kind of service at about six hours a day. When Android stops it, the native service tells the app, which stops counting on it, carries on with the wake-ups, and starts the service again the next time the app is opened.
+If Android kills the process anyway, or the service stops, WorkManager (through `react-native-background-fetch`) wakes a headless task about every 15 minutes when there's a network. Each wake-up sends until Android signals that its time is up (about 10 minutes), then stops the uploader cleanly, so no request is cut off mid-write; the next wake-up carries on from the server's byte count.
+
+The notification is local and ongoing, not a push notification; Android requires it for a foreground service. Notification permission is asked after the first save, when it means something. Android 15+ caps this kind of service at about six hours a day. When Android stops it, the native sender stops (keeping what it sent for the app), the service tells the app, and the wake-ups carry on until the app is next opened and starts the service again.
 
 **Battery saver (Doze).** When the phone sits still with the screen off, Android batches WorkManager wake-ups into maintenance windows that can be an hour or more apart, and battery saver can stop them entirely. The foreground service isn't affected while it runs. **Settings → Background sending** says whether this applies to the app and offers **Let it send in battery saver**, which opens Android's own dialog to exempt it. That's the inspector's choice, not something the app does on its own. Without the exemption the worst case for a report left on a phone in a drawer is "sends in the next window, or when the app is opened", never "lost".
 
@@ -197,13 +199,14 @@ A reply that arrives after the reset can't write a report back. If the app is ki
 app/src/core    the domain. Plain TypeScript, no React, no native modules.
   store.ts        the reports on the phone, written through to disk; refuses writes after a reset
   drafts.ts       composing: copy photos in, prepare them as they're added, validate, submit
-  outbox.ts       after Save: the upload queue, retries, send-first, replace photo, reset
+  outbox.ts       after Save: the upload queue, retries, send-first, replace photo, reset, hand-off
+  handoff.ts      what the native background sender gets, and what it reports back
   deliver.ts      one report from wherever it stands to "uploaded"
   schema.ts       versioned storage: every saved report carries its schema and is upgraded on load
 app/src/infra   adapters: SQLite, files, HTTP, the native photo encoder, settings, background work
 app/src/ui      screens, components and thin hooks
 android/…/photos  the Kotlin photo encoder
-android/…/upload  the foreground service
+android/…/upload  the foreground service and the native background sender (same protocol, in Kotlin)
 ```
 
 `Drafts` and the `Outbox` share one `ReportStore`, so each sees the other's writes, and a reset that bumps the store's epoch stops both. Their dependencies (storage, files, HTTP, encoder, clock, randomness) are interfaces (`core/ports.ts`), which is why the tests and `sim/` drive the real logic with fakes or Node adapters.
@@ -218,6 +221,7 @@ The screens get the outbox from an `OutboxProvider` (`ui/hooks/useOutbox.ts`), n
 |---|---|
 | `op-sqlite` | Fast, synchronous-capable SQLite with WAL; atomic single-row writes for the queue. |
 | `react-native-blob-util` | Streams a file from disk as a raw request body: no base64, no photo bytes in JS memory. Also used for file copies, slicing and hashing. |
+| OkHttp (already in React Native) | The native background sender's HTTP client; no new dependency. |
 | Own Kotlin encoder (no library) | One decode per photo for every quality step, HEIC on Android 9+, one photo in memory at a time. A resizer library takes one size per call, which means a fresh full decode for each step. |
 | `react-native-image-picker` | Camera and system photo picker. |
 | `react-native-permissions` | Camera and notification permission checks that can be re-run on foreground. |
@@ -232,14 +236,14 @@ The screens get the outbox from an `OutboxProvider` (`ui/hooks/useOutbox.ts`), n
 
 ## What I'd do with another day
 
-- Upload with Android's own background transfer machinery, so sending continues without the JS runtime at all.
 - An end-to-end test on a real device that scripts airplane mode and force-quits (e.g. Maestro).
 - Show thumbnails in the Sent tab progressively on 2G, with an offline image cache.
 
 ## What I knowingly left out
 
-- **iOS.** The project is there, but I haven't built or run it. Background sending is Android only.
-- **Background sending and the photo encoder haven't been tested on a device yet.** Both build, and the core logic around them is tested, but the native code itself has no automated tests.
+- **iOS.** The project is there, but I haven't built or run it. The photo encoder and background sending are Android only, so it would not work there as it stands.
+- **No automated tests for the native code.** The photo encoder and the background sender were tested on the emulator; the logic around them (hand-off, applying results) is covered by the Jest tests, but the Kotlin itself is not.
+- **The background sender is a second copy of the protocol.** Kotlin mirrors `core/deliver.ts`; a protocol change has to be made in both.
 - **Dark mode.** The app is light-only by design (see Interface).
 - **The server is a test backend.** No authentication (out of scope by the brief) and no horizontal scaling.
 - **Editing a report after it's sent**, login, push notifications, maps and video are out of scope by the brief.

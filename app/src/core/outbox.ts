@@ -1,6 +1,7 @@
 import { ChunkSizer } from './chunking';
-import { deliver } from './deliver';
+import { asUploaded, deliver, removeLocalPhotos } from './deliver';
 import { Drafts, newImage } from './drafts';
+import { handoffReport, type HandoffReport, type HandoffResult } from './handoff';
 import { photoPaths } from './processing';
 import type { Clock, ContactStore, FileStore, HttpClient, ImageEncoder, Logger, ReportRepo } from './ports';
 import { NetworkError, systemClock } from './ports';
@@ -57,6 +58,8 @@ export class Outbox {
   private rerun = false;
   /** Set during a reset: no new report or step starts, but a commit already sent may still come back. */
   private closing = false;
+  /** Set while another sender (the native one, in the background) has the reports. */
+  private paused = false;
   private wakeTimer: unknown = null;
   /** Aborts the requests of the current drain: for reset, stop, and "send this first". */
   private run: AbortController | null = null;
@@ -115,7 +118,7 @@ export class Outbox {
 
   /** Something changed that may let work proceed (submit, app foregrounded, timer). */
   kick(reason: string): void {
-    if (!this.snapshot.ready || this.closing) return;
+    if (!this.snapshot.ready || this.closing || this.paused) return;
     if (this.running) {
       this.rerun = true;
       return;
@@ -173,6 +176,53 @@ export class Outbox {
   /** True if any submitted report is not yet on the server. */
   hasPendingWork(): boolean {
     return this.store.all().some(r => PENDING_STATES.includes(r.state));
+  }
+
+  // ── Hand-off to the native sender ──────────────────────────────────────────
+
+  /**
+   * Stop sending and hand the reports that are ready to another sender.
+   * Doesn't wait for the current request: the old drain can't start another
+   * step, and the server's offsets and idempotent commit make an overlapping
+   * last request harmless. Returns null (and stays running) during a reset.
+   */
+  pause(): HandoffReport[] | null {
+    if (this.closing) return null;
+    this.paused = true;
+    this.clearWake();
+    this.run?.abort();
+    return this.pending()
+      .map(handoffReport)
+      .filter((r): r is HandoffReport => r !== null);
+  }
+
+  /**
+   * Take the reports back, apply what the other sender did with them, and carry
+   * on. Waits for the old drain to finish first, so it can't overwrite a result.
+   */
+  async resume(results: readonly HandoffResult[] = []): Promise<void> {
+    await this.idle();
+    for (const result of results) {
+      const r = this.store.get(result.id);
+      if (!r || !PENDING_STATES.includes(r.state)) continue;
+      if (result.kind === 'uploaded') {
+        this.log(`[outbox] ${r.id} was sent in the background`);
+        await this.store.write(asUploaded(r, result.at));
+        await removeLocalPhotos(this.deps.files, r);
+      } else if (result.kind === 'needs_attention') {
+        this.log(`[outbox] ${r.id} needs attention (background): ${result.problem.message}`);
+        await this.store.write({ ...r, state: 'needs_attention', problem: result.problem, attempts: 0, nextAttemptAt: null });
+      } else {
+        await this.store.write({
+          ...r,
+          images: r.images.map(i => ({ ...i, uploadedBytes: result.uploadedBytes[i.id] ?? i.uploadedBytes })),
+          lastIssue: result.issue,
+          nextAttemptAt: null,
+        });
+      }
+    }
+    this.paused = false;
+    this.kick('resumed');
   }
 
   // ── Reports that need the user ─────────────────────────────────────────────
@@ -296,7 +346,7 @@ export class Outbox {
     const epoch = this.store.epoch;
     this.clearWake();
 
-    while (epoch === this.store.epoch && !this.closing) {
+    while (epoch === this.store.epoch && !this.closing && !this.paused) {
       const next = this.nextDue();
       if (!next) break;
       const run = new AbortController();
@@ -367,7 +417,7 @@ export class Outbox {
     }
     if (epoch === this.store.epoch) {
       this.setActivity(null, epoch);
-      this.scheduleWake();
+      if (!this.paused) this.scheduleWake();
     }
   }
 

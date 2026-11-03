@@ -58,6 +58,7 @@ export class NativeHttpClient implements HttpClient {
   }
 
   private async sendFile(req: HttpRequest): Promise<HttpResponse> {
+    if (req.signal.aborted) throw new NetworkError('aborted', 'aborted');
     const { path, offset, length } = req.file!;
     await ensureDir(DIRS.chunks);
     const chunk = `${DIRS.chunks}/${Date.now()}-${offset}.part`;
