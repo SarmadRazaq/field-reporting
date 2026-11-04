@@ -556,6 +556,37 @@ describe('reset', () => {
     expect(w.server.committed()).toHaveLength(0);
   });
 
+  it('reports what the native sender sent or had a commit out for, and is not left paused', async () => {
+    const w = await world();
+    w.server.offline = true;
+    await fileReport(w, [1 * MB], 'Sent in the background');
+    await fileReport(w, [1 * MB], 'Commit was out');
+    await fileReport(w, [1 * MB], 'Halfway through a photo');
+    await settle(w);
+    const [sent, committing, partway] = w.outbox.getSnapshot().reports.map(r => r.id);
+    const handed = w.outbox.pause();
+    expect(handed).toHaveLength(3);
+
+    // What the stopped native sender handed back at the reset.
+    const outcome = await w.outbox.reset([
+      { id: sent!, kind: 'uploaded', at: w.clock.now() },
+      { id: committing!, kind: 'pending', uploadedBytes: {}, issue: null, committing: true },
+      { id: partway!, kind: 'pending', uploadedBytes: {}, issue: null },
+      { id: 'not-on-this-phone', kind: 'uploaded', at: w.clock.now() },
+    ]);
+    expect(outcome).toEqual({
+      reachedServer: [{ id: sent, description: 'Sent in the background' }],
+      mayHaveReachedServer: [{ id: committing, description: 'Commit was out' }],
+    });
+    expect(w.outbox.getSnapshot().reports).toHaveLength(0);
+
+    // Sending works straight after, without a take-back.
+    w.server.offline = false;
+    await fileReport(w, [1 * MB]);
+    await settle(w);
+    expect(states(w)).toEqual(['uploaded']);
+  });
+
   it('wipes everything on the phone, and a late reply cannot bring it back', async () => {
     const w = await world();
     await fileReport(w, [3 * MB]);

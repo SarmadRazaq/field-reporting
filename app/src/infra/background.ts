@@ -1,6 +1,6 @@
 import { AppState } from 'react-native';
 import BackgroundFetch from 'react-native-background-fetch';
-import { parseHandoffResults } from '../core/handoff';
+import { parseHandoffResults, type HandoffResult } from '../core/handoff';
 import { summarize } from '../core/status';
 import type { OutboxSnapshot } from '../core/types';
 import { PENDING_STATES } from '../core/types';
@@ -75,6 +75,20 @@ export function takeBack(): Promise<void> {
     handedOff = false;
     await outbox().resume(results);
   });
+}
+
+/**
+ * For a reset: stop the native sender (waiting until its last request has
+ * ended), delete its results file and return what it did, without applying
+ * it. Runs in the same queue as hand-off and take-back, so a take-back still
+ * under way when Start over is tapped finishes first.
+ */
+export function releaseNativeSender(): Promise<HandoffResult[]> {
+  let results: HandoffResult[] = [];
+  return serially(async () => {
+    results = parseHandoffResults(await uploadService.takeBack());
+    handedOff = false;
+  }).then(() => results);
 }
 
 const pendingCount = (s: OutboxSnapshot) => s.reports.filter(r => PENDING_STATES.includes(r.state)).length;

@@ -1,4 +1,6 @@
 import type { ResetOutcome } from '../core/outbox';
+// background.ts imports this module too; both only use each other inside functions, so the cycle is safe.
+import { releaseNativeSender } from './background';
 import { outbox } from './outbox';
 import { deleteAllServerReports } from './serverApi';
 import { clearSettings, resetMarker } from './settings';
@@ -28,7 +30,10 @@ export async function startOver({ includeServer }: { includeServer: boolean }): 
  */
 async function resetPhone(): Promise<ResetOutcome> {
   resetMarker.set();
-  const outcome = await outbox().reset();
+  // The native sender first: stopped, its results file gone, and anything it sent or
+  // had a commit out for reported like the outbox's own, instead of landing unannounced.
+  const native = await releaseNativeSender();
+  const outcome = await outbox().reset(native);
   clearSettings(); // also removes the marker
   return outcome;
 }

@@ -42,6 +42,8 @@ class BackgroundSender private constructor(
     var attempts = 0
     var nextAttemptAt = 0L
     var issue: JSONObject? = null
+    /** A commit is out and its answer not yet in; still true if the sender is stopped meanwhile. */
+    @Volatile var committing = false
   }
 
   @Volatile private var stopped = false
@@ -196,7 +198,18 @@ class BackgroundSender private constructor(
         clearIssue(s)
         for ((index, photo) in report.photos.withIndex()) upload(s, index, photo, offsets[photo.id] ?: 0)
         notifyProgress(s, committing = true)
-        when (val result = protocol.commit(report.id)) {
+        s.committing = true
+        val result = try {
+          protocol.commit(report.id)
+        } catch (e: Failure.Stopped) {
+          // Cancelled with the commit out: the server may have published it. Keep the flag for the results.
+          throw e
+        } catch (e: Exception) {
+          s.committing = false
+          throw e
+        }
+        s.committing = false
+        when (result) {
           is UploadProtocol.Commit.Committed -> return
           is UploadProtocol.Commit.Incomplete -> {}
           is UploadProtocol.Commit.Corrupted -> {
@@ -284,7 +297,7 @@ class BackgroundSender private constructor(
         else -> {
           val bytes = JSONObject()
           for ((id, n) in s.uploadedBytes) bytes.put(id, n)
-          item.put("uploadedBytes", bytes).put("issue", s.issue ?: JSONObject.NULL)
+          item.put("uploadedBytes", bytes).put("issue", s.issue ?: JSONObject.NULL).put("committing", s.committing)
         }
       }
       out.put(item)

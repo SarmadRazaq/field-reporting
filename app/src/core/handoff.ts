@@ -30,6 +30,8 @@ export type HandoffResult =
       /** Bytes the server confirmed per photo id. */
       uploadedBytes: Record<string, number>;
       issue: { reason: TransientReason; message: string; at: number; since: number } | null;
+      /** The sender was stopped while its commit was out: the server may have published the report. */
+      committing?: boolean;
     };
 
 /** Reports the native sender can take: waiting, with every photo prepared. */

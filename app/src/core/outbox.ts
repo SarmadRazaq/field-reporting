@@ -298,11 +298,22 @@ export class Outbox {
    * publishing that report right now. Rather than abort it and leave its fate
    * unknown, reset lets that one request finish (for at most a little over its
    * own timeout) and says where the report ended up.
+   *
+   * `native` is what the native sender did with reports it had, taken (and
+   * stopped) just before: a report it sent, or whose commit it had out when it
+   * was stopped, is reported the same way, never silently wiped.
    */
-  async reset(): Promise<ResetOutcome> {
+  async reset(native: readonly HandoffResult[] = []): Promise<ResetOutcome> {
     this.closing = true;
     this.clearWake();
     const outcome: ResetOutcome = { reachedServer: [], mayHaveReachedServer: [] };
+    for (const result of native) {
+      const r = this.store.get(result.id);
+      if (!r || !PENDING_STATES.includes(r.state)) continue;
+      const entry = { id: r.id, description: r.description };
+      if (result.kind === 'uploaded') outcome.reachedServer.push(entry);
+      else if (result.kind === 'pending' && result.committing) outcome.mayHaveReachedServer.push(entry);
+    }
     const committing = this.activity?.stage === 'committing' ? this.store.get(this.activity.reportId) : undefined;
     if (committing && this.running) {
       this.log(`[outbox] reset waits for the commit of ${committing.id}`);
@@ -322,6 +333,8 @@ export class Outbox {
     await this.store.clear();
     await this.deps.files.clearAll();
     this.activity = null;
+    // The native sender was stopped before the reset, so nothing holds the reports any more.
+    this.paused = false;
     this.closing = false;
     this.emit();
     this.log('[outbox] reset');
