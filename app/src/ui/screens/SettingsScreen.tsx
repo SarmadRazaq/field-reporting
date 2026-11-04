@@ -3,14 +3,17 @@ import { useState } from 'react';
 import { ScrollView, StyleSheet, Switch, Text, TextInput, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { PENDING_STATES } from '../../core/types';
-import { startOver, deleteServerReports, type ResetResult, type ServerResult } from '../../infra/reset';
+import { describeReset } from '../../core/resetProgress';
+import { dismissResetResult, retryServerDelete, startOver } from '../../infra/reset';
 import { pingServer } from '../../infra/serverApi';
 import { DEFAULT_SERVER_URL, getServerUrl, setServerUrl } from '../../infra/settings';
 import { Button } from '../components/Button';
 import { Notice } from '../components/Notice';
 import { Sheet } from '../components/Sheet';
 import { useBatteryExemption } from '../hooks/useBatteryExemption';
+import { useNow } from '../hooks/useNow';
 import { useOutbox, useOutboxCommands } from '../hooks/useOutbox';
+import { useReset } from '../hooks/useReset';
 import type { TabScreenProps } from '../navigation/types';
 import { color, radius, space, type } from '../theme';
 
@@ -26,8 +29,10 @@ export function SettingsScreen(_: TabScreenProps<'Settings'>) {
   const [check, setCheck] = useState<Check>({ state: 'idle' });
   const [sheet, setSheet] = useState(false);
   const [alsoServer, setAlsoServer] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<ResetResult | ServerResult | null>(null);
+  const { progress, result } = useReset();
+  const now = useNow();
+  const busy = progress.phase !== 'idle';
+  const waitingOn = describeReset(progress, now);
 
   const waiting = snapshot.reports.filter(r => PENDING_STATES.includes(r.state) || r.state === 'needs_attention').length;
   const sentReceipts = snapshot.reports.filter(r => r.state === 'uploaded').length;
@@ -49,14 +54,12 @@ export function SettingsScreen(_: TabScreenProps<'Settings'>) {
   }
 
   async function confirmReset() {
-    setBusy(true);
-    const r = await startOver({ includeServer: alsoServer });
+    // Runs to the end even if this screen goes away; the outcome is stored and shown here when it's done.
+    await startOver({ includeServer: alsoServer });
     queryClient.clear();
     setUrl(getServerUrl());
-    setBusy(false);
     setSheet(false);
     setAlsoServer(false);
-    setResult(r);
   }
 
   return (
@@ -124,13 +127,14 @@ export function SettingsScreen(_: TabScreenProps<'Settings'>) {
           <Text style={[type.body, { color: color.soft }]}>
             Deletes everything this app keeps on this phone. You choose whether the server's reports go too.
           </Text>
-          <Button label="Start over" icon="trash" variant="danger" onPress={() => setSheet(true)} />
-          {result?.server === 'failed' ? (
+          <Button label="Start over" icon="trash" variant="danger" onPress={() => setSheet(true)} disabled={busy} />
+          {waitingOn ? <ResetWait text={waitingOn.text} secondsLeft={waitingOn.secondsLeft} /> : null}
+          {busy ? null : result?.server === 'failed' ? (
             <Notice
               tone="red"
               icon="warning"
               title="The phone was cleared. The server was not."
-              action={<Button label="Try the server again" variant="secondary" compact onPress={async () => setResult(await deleteServerReports())} />}
+              action={<Button label="Try the server again" variant="secondary" compact onPress={() => void retryServerDelete()} />}
             >
               {`${result.message}. Its reports are still there.`}
             </Notice>
@@ -139,20 +143,31 @@ export function SettingsScreen(_: TabScreenProps<'Settings'>) {
               {result.server === 'deleted' ? 'This phone and the server were cleared.' : 'This phone was cleared. The server keeps its reports.'}
             </Text>
           ) : null}
-          {result && 'inFlight' in result && result.inFlight.reachedServer.length ? (
+          {!busy && result && 'inFlight' in result && result.inFlight.reachedServer.length ? (
             <Notice tone="info" icon="cloudCheck" title="One report got there first">
               {`"${result.inFlight.reachedServer.map(r => r.description).join('", "')}" was being confirmed when you started over, and the server confirmed it. It stays on the server; you can see it in Sent.`}
             </Notice>
           ) : null}
-          {result && 'inFlight' in result && result.inFlight.mayHaveReachedServer.length ? (
+          {!busy && result && 'inFlight' in result && result.inFlight.mayHaveReachedServer.length ? (
             <Notice tone="amber" icon="warning" title="One report may be on the server">
               {`"${result.inFlight.mayHaveReachedServer.map(r => r.description).join('", "')}" was being confirmed when you started over, and the server didn't answer in time. Check Sent to see whether it arrived.`}
             </Notice>
           ) : null}
+          {!busy && result ? <Button label="Dismiss" variant="secondary" compact onPress={dismissResetResult} /> : null}
         </Section>
       </ScrollView>
 
-      <Sheet visible={sheet} title="Start over?" onClose={() => !busy && setSheet(false)}>
+      <Sheet visible={sheet} title={busy ? 'Starting over' : 'Start over?'} onClose={() => setSheet(false)}>
+        {waitingOn ? (
+          <>
+            <ResetWait text={waitingOn.text} secondsLeft={waitingOn.secondsLeft} />
+            <Text style={[type.caption, { color: color.muted }]}>
+              This can't be stopped now. You can leave: it finishes on its own, and Settings shows how it ended.
+            </Text>
+            <Button label="Close" variant="secondary" onPress={() => setSheet(false)} />
+          </>
+        ) : (
+          <>
         <View style={{ gap: space[2] }}>
           <Text style={[type.body, { color: color.ink }]}>This deletes from this phone:</Text>
           <Bullet>
@@ -181,9 +196,25 @@ export function SettingsScreen(_: TabScreenProps<'Settings'>) {
         <Text style={[type.caption, { color: alsoServer ? color.red700 : color.muted }]}>
           {alsoServer ? 'Reports on the server are deleted too, for everyone.' : 'Reports already on the server stay there.'}
         </Text>
-        <Button label={busy ? (confirming ? 'Waiting for the server…' : 'Deleting…') : 'Delete everything on this phone'} variant="destructive" onPress={confirmReset} disabled={busy} />
-        <Button label="Cancel" variant="secondary" onPress={() => setSheet(false)} disabled={busy} />
+        <Button label="Delete everything on this phone" variant="destructive" onPress={confirmReset} />
+        <Button label="Cancel" variant="secondary" onPress={() => setSheet(false)} />
+          </>
+        )}
       </Sheet>
+    </View>
+  );
+}
+
+/** What a running reset is waiting on, with a countdown that ends at the wait's bound. */
+function ResetWait({ text, secondsLeft }: { text: string; secondsLeft: number | null }) {
+  return (
+    <View style={{ gap: space[1] }} accessibilityLiveRegion="polite">
+      <Text style={[type.body, { color: color.ink }]}>{text}</Text>
+      {secondsLeft !== null ? (
+        <Text style={[type.caption, { color: color.muted }]}>
+          {secondsLeft > 0 ? `At most ${secondsLeft} s more.` : 'Finishing…'}
+        </Text>
+      ) : null}
     </View>
   );
 }

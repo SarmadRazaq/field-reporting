@@ -45,7 +45,7 @@ export interface ResetOutcome {
 }
 
 /** How long a reset waits for a commit already sent: a little over the commit's own timeout. */
-const COMMIT_SETTLE_MS = TIMEOUTS.controlMs + 2_000;
+export const COMMIT_SETTLE_MS = TIMEOUTS.controlMs + 2_000;
 
 export class Outbox {
   readonly drafts: Drafts;

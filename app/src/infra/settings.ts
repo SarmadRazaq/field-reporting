@@ -44,6 +44,28 @@ export const resetMarker = {
   },
 };
 
+/**
+ * How the last Start over ended, kept until the inspector dismisses it, so a
+ * reset that finished while they were away still says where things stand.
+ * Written after the reset's own clearSettings(), so it survives that.
+ */
+export const lastResetStore = {
+  get(): unknown {
+    const { rows } = database().executeSync("SELECT value FROM settings WHERE key = 'lastReset'");
+    try {
+      return rows[0] ? JSON.parse(String(rows[0].value)) : null;
+    } catch {
+      return null;
+    }
+  },
+  set(value: unknown) {
+    database().executeSync("INSERT OR REPLACE INTO settings (key, value) VALUES ('lastReset', ?)", [JSON.stringify(value)]);
+  },
+  clear() {
+    database().executeSync("DELETE FROM settings WHERE key = 'lastReset'");
+  },
+};
+
 export function clearSettings() {
   database().executeSync('DELETE FROM settings');
   serverUrl = null;
