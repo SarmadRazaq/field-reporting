@@ -119,6 +119,9 @@ class UploadProtocol(private val baseUrl: String, private val isStopped: () -> B
     if (isStopped()) throw Failure.Stopped()
     val call = client.newBuilder().callTimeout(timeoutMs, TimeUnit.MILLISECONDS).build().newCall(request)
     current = call
+    // stop() may have run between the check above and `current = call`, cancelling nothing.
+    // Checking again after publishing the call closes that gap: one of the two always sees the other.
+    if (isStopped()) call.cancel()
     try {
       call.execute().use { res -> return Triple(res.code, parse(res), res.headers.associate { it.first.lowercase() to it.second }) }
     } catch (e: IOException) {

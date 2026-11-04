@@ -105,7 +105,8 @@ class UploadServiceModule(private val context: ReactApplicationContext) : ReactC
   fun takeBack(promise: Promise) {
     Thread {
       try {
-        BackgroundSender.stop()
+        // Blocks until the sender's thread has ended, so the app never sends alongside it.
+        if (!BackgroundSender.stop()) Log.w(TAG, "taking back while a native request may still be open")
         promise.resolve(BackgroundSender.takeResults(context))
       } catch (e: Exception) {
         promise.reject("take_back_failed", e)

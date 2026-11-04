@@ -22,6 +22,17 @@ export interface DeliveryContext {
 /** How many times a commit may bounce back (incomplete / restart) before we call it a server problem. */
 const MAX_ROUNDS = 6;
 const MAX_CORRUPTIONS = 2;
+/** How often a chunk may meet "busy" (423) in a row before it counts as an ordinary transient failure. */
+const MAX_BUSY_WAITS = 5;
+const BUSY_WAIT_MS = 2_000;
+
+function isBusy(e: unknown): e is DeliveryError {
+  return e instanceof DeliveryError && e.failure.type === 'transient' && e.failure.reason === 'busy';
+}
+
+function sleep(clock: Clock, ms: number): Promise<void> {
+  return new Promise(resolve => clock.setTimeout(resolve, ms));
+}
 
 /**
  * Take one report from wherever it stands to `uploaded`. Each step is persisted
@@ -128,6 +139,7 @@ async function uploadImages(ctx: DeliveryContext, report: LocalReport, offsets: 
     const size = image.processed!.size;
     let offset = offsets.get(image.id) ?? 0;
     let resyncs = 0;
+    let busyWaits = 0;
     r = await saveOffset(ctx, r, image, offset);
 
     while (offset < size) {
@@ -143,9 +155,17 @@ async function uploadImages(ctx: DeliveryContext, report: LocalReport, offsets: 
           TIMEOUTS.chunkMs,
         );
       } catch (e) {
+        // 423: the server is still finishing another request for this photo, usually the native
+        // sender's, cancelled at the hand-back. Not a link failure: wait briefly, send the same chunk.
+        if (isBusy(e) && busyWaits < MAX_BUSY_WAITS) {
+          busyWaits += 1;
+          await sleep(ctx.clock, e.failure.type === 'transient' ? e.failure.retryAfterMs ?? BUSY_WAIT_MS : BUSY_WAIT_MS);
+          continue;
+        }
         if (e instanceof NetworkError && e.kind !== 'aborted') ctx.chunks.struggled();
         throw e;
       }
+      busyWaits = 0;
       if (result.resynced) {
         if (++resyncs > 5)
           throw new DeliveryError({ type: 'transient', reason: 'server', message: 'Upload position keeps changing' });

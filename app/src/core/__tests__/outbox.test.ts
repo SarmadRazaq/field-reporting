@@ -16,6 +16,15 @@ function expectIntact(w: World) {
 
 const states = (w: World) => w.outbox.getSnapshot().reports.map(r => r.state);
 
+/** Fires timers while a delivery is still running (settle() waits for idle first, so it can't fire a wait inside one). */
+async function pump(w: World, rounds = 100) {
+  for (let i = 0; i < rounds; i++) {
+    await flush();
+    w.clock.fireNext();
+  }
+  await settle(w);
+}
+
 describe('composing', () => {
   it('refuses zero photos, a blank description, and a sixth photo', async () => {
     const w = await world();
@@ -444,6 +453,31 @@ describe('hand-off to the native sender', () => {
     await settle(w);
     expect(w.server.committed().map(r => r.id)).toEqual([partly]);
     expect(byId(partly).state).toBe('uploaded');
+  });
+
+  it('waits out a photo the server is still busy with after a take-back, without calling it a failure', async () => {
+    const w = await world();
+    // The native sender's last chunk, cancelled at the take-back, is still holding the photo on the server.
+    w.server.inject('chunk', { kind: 'status', status: 423, headers: { 'retry-after': '2' } }, 2);
+    const issues: unknown[] = [];
+    w.outbox.subscribe(() => {
+      for (const r of w.outbox.getSnapshot().reports) if (r.lastIssue || r.attempts > 0) issues.push(r.lastIssue);
+    });
+    await fileReport(w, [1 * MB]);
+    await pump(w);
+    expect(issues).toEqual([]);
+    expect(states(w)).toEqual(['uploaded']);
+    expect(w.server.committed()[0]!.commits).toBe(1);
+    expectIntact(w);
+  });
+
+  it('treats a photo that stays busy as a transient failure, never as needing attention', async () => {
+    const w = await world();
+    w.server.inject('chunk', { kind: 'status', status: 423 }, 8);
+    await fileReport(w, [1 * MB]);
+    await pump(w);
+    expect(states(w)).toEqual(['uploaded']);
+    expect(w.server.committed()[0]!.commits).toBe(1);
   });
 
   it('carries on from the server\'s bytes when taken back with no news, and lands once', async () => {

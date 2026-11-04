@@ -75,13 +75,26 @@ class BackgroundSender private constructor(
     thread.start()
   }
 
-  private fun stop() {
+  /**
+   * Stops sending and returns only once the sender thread has ended, so no
+   * request of ours is still on the wire when the app starts its own. Every
+   * call has a timeout, so this is bounded; cancelling repeatedly covers a call
+   * that was being set up while we cancelled. Returns false if the thread
+   * somehow outlived the bound.
+   */
+  private fun stop(): Boolean {
     stopped = true
-    protocol.cancel()
-    wake()
-    thread.join(STOP_WAIT_MS)
+    val deadline = System.currentTimeMillis() + STOP_WAIT_MS
+    while (thread.isAlive && System.currentTimeMillis() < deadline) {
+      protocol.cancel()
+      wake()
+      thread.join(STOP_POLL_MS)
+    }
+    val ended = !thread.isAlive
+    if (!ended) Log.w(TAG, "sender thread still running after ${STOP_WAIT_MS / 1000}s")
     release()
     write()
+    return ended
   }
 
   private fun release() {
@@ -92,6 +105,12 @@ class BackgroundSender private constructor(
   }
 
   private fun wake() = synchronized(lock) { lock.notifyAll() }
+
+  /** Sleeps up to `ms`, ending early (and throwing Stopped) if the sender is stopped meanwhile. */
+  private fun pause(ms: Long) {
+    synchronized(lock) { if (!stopped) lock.wait(ms.coerceAtLeast(1)) }
+    if (stopped) throw Failure.Stopped()
+  }
 
   private fun run() {
     try {
@@ -197,6 +216,7 @@ class BackgroundSender private constructor(
   private fun upload(s: State, index: Int, photo: Photo, from: Long) {
     var offset = from
     var resyncs = 0
+    var busyWaits = 0
     s.uploadedBytes[photo.id] = offset
     while (offset < photo.size) {
       wakeLock.acquire(WAKE_LOCK_MS)
@@ -206,9 +226,17 @@ class BackgroundSender private constructor(
       val (next, resynced) = try {
         protocol.sendChunk(s.report.id, photo, offset, length)
       } catch (e: Failure.Transient) {
+        // The server is still finishing a request that was cancelled at the hand-off. That isn't a
+        // failure of the link: wait briefly and send the same chunk, without backoff or a smaller chunk.
+        if (e.reason == "busy" && busyWaits < MAX_BUSY_WAITS) {
+          busyWaits += 1
+          pause(e.retryAfterMs ?: BUSY_WAIT_MS)
+          continue
+        }
         chunk = maxOf(CHUNK_MIN, chunk / 2)
         throw e
       }
+      busyWaits = 0
       if (resynced) {
         if (++resyncs > 5) throw Failure.Transient("server", "Upload position keeps changing")
       } else {
@@ -283,7 +311,12 @@ class BackgroundSender private constructor(
     private const val BACKOFF_BASE_MS = 2_000L
     private const val BACKOFF_MAX_MS = 60_000L
     private const val BACKOFF_OFFLINE_MAX_MS = 300_000L
-    private const val STOP_WAIT_MS = 5_000L
+    /** Longer than the longest call (a chunk, 60 s), so a stop always outlasts the request it cancels. */
+    private const val STOP_WAIT_MS = UploadProtocol.CHUNK_TIMEOUT_MS + 10_000L
+    private const val STOP_POLL_MS = 250L
+    /** A 423 means another request (usually the app's own, just cancelled) still holds the photo. */
+    private const val MAX_BUSY_WAITS = 5
+    private const val BUSY_WAIT_MS = 2_000L
     /** Longer than one chunk can take; renewed before every chunk. */
     private const val WAKE_LOCK_MS = 2 * 60_000L
 
@@ -313,11 +346,15 @@ class BackgroundSender private constructor(
       current = BackgroundSender(context.applicationContext, reports, baseUrl, listener).also { it.start() }
     }
 
-    /** Stops the sender, if one is running, and waits (briefly) for its last request to end. */
+    /**
+     * Stops the sender, if one is running, and returns once its thread has ended
+     * (true), so nothing it sent is still in flight. False only if it outlived the bound.
+     */
     @Synchronized
-    fun stop() {
-      current?.stop()
+    fun stop(): Boolean {
+      val ended = current?.stop() ?: true
       current = null
+      return ended
     }
 
     /** What the last sender did, or null; removed once read, so it is applied once. */
