@@ -10,7 +10,7 @@ sim/      Runs the app's upload core in Node against the real server, through th
 
 Screen recording: _link to be added_
 
-**Hosted server:** `https://field-reports-server.fly.dev` (admin page at [`/admin`](https://field-reports-server.fly.dev/admin)). It's the same server as in `server/`, running on Fly.io, so you can test without setting up a backend. The admin page and the failure controls need the admin token, which is sent with the submission rather than kept in this public repo. You can also run the server yourself, see below.
+**Hosted server:** `https://field-reports-server.fly.dev` (admin page at [`/admin`](https://field-reports-server.fly.dev/admin)). It's the same server as in `server/`, running on Fly.io, so you can test without setting up a backend. The admin page and the failure controls need the admin token `2dd8aa57ab78fb3ce9ad36bfe7ae1d2782124136e599d74840b0a50e65f20b39`: in the browser, use any username with the token as the password. It's published here because this is a throwaway test server; it guards against strangers stumbling on the controls, not against reviewers. You can also run the server yourself, see below.
 
 **Not done** (details under [What I knowingly left out](#what-i-knowingly-left-out)): no automated tests for the Kotlin code (photo encoder, background sender), which was tested on the Android emulator only, not on a physical phone; iOS isn't built or run.
 
@@ -96,7 +96,7 @@ npm run sim              # server must be running on :4000
 Against the hosted server (PowerShell; in bash, put the variables before the command):
 
 ```powershell
-$env:SERVER="https://field-reports-server.fly.dev"; $env:ADMIN_TOKEN="<token>"; $env:NODE_OPTIONS="--dns-result-order=ipv4first"; npm run sim
+$env:SERVER="https://field-reports-server.fly.dev"; $env:ADMIN_TOKEN="2dd8aa57ab78fb3ce9ad36bfe7ae1d2782124136e599d74840b0a50e65f20b39"; $env:NODE_OPTIONS="--dns-result-order=ipv4first"; npm run sim
 ```
 
 `NODE_OPTIONS` makes Node try IPv4 first, for networks without IPv6.
@@ -142,7 +142,7 @@ npm run chaos -- rule chunk hang --times 1
 Routes are `manifest`, `chunk`, `commit` or `any`. `SERVER=http://host:4000` points the CLI at another machine. For the hosted server, set both `SERVER` and the token:
 
 ```powershell
-$env:SERVER="https://field-reports-server.fly.dev"; $env:ADMIN_TOKEN="<token>"; npm run chaos -- preset flaky
+$env:SERVER="https://field-reports-server.fly.dev"; $env:ADMIN_TOKEN="2dd8aa57ab78fb3ce9ad36bfe7ae1d2782124136e599d74840b0a50e65f20b39"; npm run chaos -- preset flaky
 ```
 
 On the hosted server, Fly's proxy sits between the phone and the server. An injected "hang" or "drop mid-body" may reach the phone as a timeout or a 502 rather than a raw dropped connection. The app retries both the same way.
