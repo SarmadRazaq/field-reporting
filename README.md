@@ -315,16 +315,18 @@ Where the brief left room, this is what I decided:
 
 ## What I'd do with another day
 
-- An end-to-end test on a real device that scripts airplane mode and force-quits (e.g. Maestro).
-- Tests for the Kotlin background sender against the server's failure injection, and one protocol description both clients are checked against.
-- Try it on phones with aggressive battery managers (Samsung, Xiaomi), which can stop background work beyond what stock Android does.
-- Show thumbnails in the Sent tab progressively on 2G, with an offline image cache.
+- **Delete one unsent report.** Today a single report can only be discarded once the server has refused it; anything else goes with Start over. I'd allow it for any report not yet being confirmed, cancelling its current chunk first.
+- **Edit a report before it sends.** Change the description or swap photos while it's still waiting, without starting a new report.
+- **Show which server the Sent tab is asking.** A wrong address currently looks like an empty or unreachable server; naming it makes the mistake obvious.
+- **Prepare photos in the background too.** A report whose photos weren't prepared before the app was closed waits until the app is next opened or woken; the native side could shrink them itself.
+- **"Wi-Fi only" for large reports**, for inspectors on a metered plan, with the size shown so it's their call.
+- **Progressive thumbnails in Sent on 2G**, with an offline image cache, so the list is useful before every photo has loaded.
 
 ## What I knowingly left out
 
 - **iOS.** The project is there, but I haven't built or run it. The photo encoder and background sending are Android only, so it would not work there as it stands.
-- **Tested by hand, on two devices.** Everything above ran on an Android 17 emulator (Pixel 7 Pro) and a physical Pixel 6 Pro (Android 17) against the hosted server: the main scenario, every failure preset, force-quits mid-upload, background sending, the photo limits, permissions and Start over. There's no scripted device test, so a regression there would only be caught by repeating it by hand. Nothing ran on Android 12 or older, or on phones with aggressive battery managers.
-- **No automated tests for the native code.** The photo encoder and the background sender were tested by hand on the emulator and the Pixel 6 Pro; the logic around them (hand-off, applying results) is covered by the Jest tests, but the Kotlin itself is not.
+- **Deleting or editing a single waiting report.** A saved report can't be changed or removed on its own until the server refuses it (then Retry, Replace photo and Discard appear). Start over removes everything.
+- **Background photo preparation.** The native sender only sends reports whose photos are already prepared; any others wait for the app.
 - **The background sender is a second copy of the protocol.** Kotlin mirrors `core/deliver.ts`; a protocol change has to be made in both.
 - **Dark mode.** The app is light-only by design (see Interface).
 - **The server is a test backend.** The upload API has no authentication (out of scope by the brief): anyone with the URL can send reports or use the "delete every report" call behind Start over's "for everyone" switch. Only the admin page and failure controls are behind a token. It runs on one machine with no horizontal scaling.
