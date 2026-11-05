@@ -32,7 +32,11 @@ const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 async function admin(method: string, p: string, body?: unknown) {
   const res = await fetch(SERVER + p, {
     method,
-    headers: body ? { 'content-type': 'application/json' } : {},
+    headers: {
+      ...(body ? { 'content-type': 'application/json' } : {}),
+      // For a server started with ADMIN_TOKEN (e.g. the Fly deploy).
+      ...(process.env.ADMIN_TOKEN ? { authorization: `Bearer ${process.env.ADMIN_TOKEN}` } : {}),
+    },
     body: body ? JSON.stringify(body) : undefined,
   });
   if (!res.ok) throw new Error(`${method} ${p} → ${res.status}`);
