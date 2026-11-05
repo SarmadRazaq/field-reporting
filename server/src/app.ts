@@ -11,9 +11,11 @@ export interface AppOptions {
   dataDir: string;
   chaos?: Chaos;
   log?: (msg: string) => void;
+  /** When set, /admin and the chaos controls require it. */
+  adminToken?: string;
 }
 
-export async function createApp({ dataDir, chaos = new Chaos(), log = console.log }: AppOptions) {
+export async function createApp({ dataDir, chaos = new Chaos(), log = console.log, adminToken }: AppOptions) {
   await fs.mkdir(dataDir, { recursive: true });
   const db = openDb(dataDir);
   const storage = new Storage(dataDir);
@@ -26,7 +28,7 @@ export async function createApp({ dataDir, chaos = new Chaos(), log = console.lo
     res.on('finish', () => log(`${req.method} ${req.originalUrl} ${res.statusCode} ${Date.now() - started}ms`));
     next();
   });
-  app.use(adminRoutes({ db, storage, chaos }));
+  app.use(adminRoutes({ db, storage, chaos, adminToken }));
   app.use('/v1', protocolRoutes({ db, storage, chaos, log }));
   app.get('/', (_req, res) => res.redirect('/admin'));
 

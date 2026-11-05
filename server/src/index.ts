@@ -4,7 +4,7 @@ import { createApp } from './app.js';
 const port = Number(process.env.PORT ?? 4000);
 const dataDir = path.resolve(process.env.DATA_DIR ?? 'data');
 
-const { app, collectGarbage } = await createApp({ dataDir });
+const { app, collectGarbage } = await createApp({ dataDir, adminToken: process.env.ADMIN_TOKEN || undefined });
 
 const server = app.listen(port, '0.0.0.0', () => {
   console.log(`Field Reports server on http://localhost:${port}  (admin: http://localhost:${port}/admin)`);

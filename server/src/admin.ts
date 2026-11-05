@@ -1,11 +1,48 @@
-import express, { Router } from 'express';
+import express, { Router, type RequestHandler } from 'express';
+import { timingSafeEqual } from 'node:crypto';
 import { PRESETS, ROUTE_TAGS, type Chaos, type RuleInput } from './chaos.js';
 import type { Db } from './db.js';
 import type { Storage } from './storage.js';
 
 /** Chaos controls and an inspector view. Never gated by chaos itself. */
-export function adminRoutes({ db, storage, chaos }: { db: Db; storage: Storage; chaos: Chaos }): Router {
+/**
+ * With a token set, the admin page and the chaos controls need it: as a Bearer token
+ * (the CLI) or as the password of HTTP Basic auth (the browser, any username).
+ * The upload protocol under /v1 stays open, as the app has no credentials to send.
+ */
+function requireToken(token: string): RequestHandler {
+  const expected = Buffer.from(token);
+  const matches = (given: string) => {
+    const b = Buffer.from(given);
+    return b.length === expected.length && timingSafeEqual(b, expected);
+  };
+  return (req, res, next) => {
+    const header = req.get('authorization') ?? '';
+    const [scheme, value = ''] = header.split(' ', 2);
+    let given = '';
+    if (scheme === 'Bearer') given = value;
+    else if (scheme === 'Basic') {
+      const decoded = Buffer.from(value, 'base64').toString();
+      given = decoded.slice(decoded.indexOf(':') + 1);
+    }
+    if (given && matches(given)) return next();
+    res.set('WWW-Authenticate', 'Basic realm="Field Reports admin"').status(401).json({ code: 'unauthorized' });
+  };
+}
+
+export function adminRoutes({
+  db,
+  storage,
+  chaos,
+  adminToken,
+}: {
+  db: Db;
+  storage: Storage;
+  chaos: Chaos;
+  adminToken?: string;
+}): Router {
   const r = Router();
+  if (adminToken) r.use(['/admin', '/__chaos', '/__admin'], requireToken(adminToken));
   r.use(express.json());
 
   r.get('/__chaos', (_req, res) => {

@@ -13,6 +13,7 @@
  *   npm run chaos -- rule chunk hang --times 1
  *
  * SERVER=http://host:4000 overrides the target.
+ * ADMIN_TOKEN=... is sent as a Bearer token, for a server started with one.
  */
 const base = process.env.SERVER ?? 'http://localhost:4000';
 const [cmd, ...rest] = process.argv.slice(2);
@@ -25,7 +26,10 @@ function flag(name: string): string | undefined {
 async function call(method: string, path: string, body?: unknown) {
   const res = await fetch(base + path, {
     method,
-    headers: body ? { 'content-type': 'application/json' } : {},
+    headers: {
+      ...(body ? { 'content-type': 'application/json' } : {}),
+      ...(process.env.ADMIN_TOKEN ? { authorization: `Bearer ${process.env.ADMIN_TOKEN}` } : {}),
+    },
     body: body ? JSON.stringify(body) : undefined,
   });
   const json = await res.json();
