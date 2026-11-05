@@ -72,14 +72,14 @@ cd app
 npx react-native run-android --mode release
 ```
 
-**Pointing the app at the server.** The default is `http://10.0.2.2:4000`, which is the host machine as seen from the Android emulator. For the hosted server, use `https://field-reports-server.fly.dev`. A physical phone on the same Wi-Fi as a local server uses the computer's LAN address. Set it in the app under **Settings → Connection** and tap **Save and check**.
+**Pointing the app at the server.** A release build talks to the hosted server, `https://field-reports-server.fly.dev`, out of the box, so it works on any phone. A debug build defaults to `http://10.0.2.2:4000`, which is the host machine as seen from the Android emulator. Start over resets the address to the build's default. To use a local server from a physical phone on the same Wi-Fi, enter the computer's LAN address. Set it in the app under **Settings → Connection** and tap **Save and check**.
 
 Don't use `adb reverse` for testing. It tunnels over USB, so airplane mode no longer cuts the app off from the server, and that's the very thing being tested.
 
 ### 3. Tests
 
 ```sh
-cd app && npm test       # 59 tests: the upload engine with fake network, disk and clock; the background hand-off; stored-data upgrades; the failure screens
+cd app && npm test       # 66 tests: the upload engine with fake network, disk and clock; the background hand-off; stored-data upgrades; the failure screens
 cd server && npm test    # 17 tests: the upload protocol, the failure injection and the admin token
 ```
 

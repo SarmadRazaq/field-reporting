@@ -1,12 +1,21 @@
 import { database } from './db';
 
+/** The hosted test server on Fly.io: the same server as server/, reachable from any phone. */
+export const HOSTED_SERVER_URL = 'https://field-reports-server.fly.dev';
+
 /**
  * The Android emulator reaches the host machine at 10.0.2.2. Traffic to it goes
  * through the emulated radio, so airplane mode really cuts it (adb reverse
  * would tunnel around airplane mode and hide the very thing we test).
- * A phone on Wi-Fi uses the host's LAN address, set in Settings.
  */
-export const DEFAULT_SERVER_URL = 'http://10.0.2.2:4000';
+export const EMULATOR_SERVER_URL = 'http://10.0.2.2:4000';
+
+/**
+ * Debug builds run on the emulator against a local server; release builds go on
+ * real phones, where 10.0.2.2 leads nowhere, so they start on the hosted server.
+ * Start over clears settings, so this is also where a release build lands after it.
+ */
+export const DEFAULT_SERVER_URL = __DEV__ ? EMULATOR_SERVER_URL : HOSTED_SERVER_URL;
 
 let serverUrl: string | null = null;
 
