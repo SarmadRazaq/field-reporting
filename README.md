@@ -12,7 +12,7 @@ Screen recording: _link to be added_
 
 **Hosted server:** `https://field-reports-server.fly.dev` (admin page at [`/admin`](https://field-reports-server.fly.dev/admin)). It's the same server as in `server/`, running on Fly.io, so you can test without setting up a backend. The admin page and the failure controls need the admin token `2dd8aa57ab78fb3ce9ad36bfe7ae1d2782124136e599d74840b0a50e65f20b39`: in the browser, use any username with the token as the password. It's published here because this is a throwaway test server; it guards against strangers stumbling on the controls, not against reviewers. You can also run the server yourself, see below.
 
-**Not done** (details under [What I knowingly left out](#what-i-knowingly-left-out)): no automated tests for the Kotlin code (photo encoder, background sender), which was tested on the Android emulator only, not on a physical phone; iOS isn't built or run.
+**Not done** (details under [What I knowingly left out](#what-i-knowingly-left-out)): no automated tests for the Kotlin code (photo encoder, background sender) and no scripted device test; both were tested by hand on an emulator and a Pixel 6 Pro. iOS isn't built or run.
 
 Contents: [Running it](#running-it) · [Making it fail](#making-it-fail) · [Decisions, and why](#decisions-and-why) · [Judgement calls](#judgement-calls) · [What I'd do with another day](#what-id-do-with-another-day) · [What I knowingly left out](#what-i-knowingly-left-out)
 
@@ -325,8 +325,8 @@ Where the brief left room, this is what I decided:
 ## What I knowingly left out
 
 - **iOS.** The project is there, but I haven't built or run it. The photo encoder and background sending are Android only, so it would not work there as it stands.
-- **Only tested on the emulator.** Everything above ran on an Android 17 emulator (Pixel 7 Pro), not a physical phone, and not on Android 12 or older.
-- **No automated tests for the native code.** The photo encoder and the background sender were tested on the emulator; the logic around them (hand-off, applying results) is covered by the Jest tests, but the Kotlin itself is not.
+- **Tested by hand, on two devices.** Everything above ran on an Android 17 emulator (Pixel 7 Pro) and a physical Pixel 6 Pro (Android 17) against the hosted server: the main scenario, every failure preset, force-quits mid-upload, background sending, the photo limits, permissions and Start over. There's no scripted device test, so a regression there would only be caught by repeating it by hand. Nothing ran on Android 12 or older, or on phones with aggressive battery managers.
+- **No automated tests for the native code.** The photo encoder and the background sender were tested by hand on the emulator and the Pixel 6 Pro; the logic around them (hand-off, applying results) is covered by the Jest tests, but the Kotlin itself is not.
 - **The background sender is a second copy of the protocol.** Kotlin mirrors `core/deliver.ts`; a protocol change has to be made in both.
 - **Dark mode.** The app is light-only by design (see Interface).
 - **The server is a test backend.** The upload API has no authentication (out of scope by the brief): anyone with the URL can send reports or use the "delete every report" call behind Start over's "for everyone" switch. Only the admin page and failure controls are behind a token. It runs on one machine with no horizontal scaling.
