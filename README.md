@@ -12,8 +12,6 @@ Screen recording: _link to be added_
 
 **Hosted server:** `https://field-reports-server.fly.dev` (admin page at [`/admin`](https://field-reports-server.fly.dev/admin)). It's the same server as in `server/`, running on Fly.io, so you can test without setting up a backend. The admin page and the failure controls need the admin token `2dd8aa57ab78fb3ce9ad36bfe7ae1d2782124136e599d74840b0a50e65f20b39`: in the browser, use any username with the token as the password. It's published here because this is a throwaway test server; it guards against strangers stumbling on the controls, not against reviewers. You can also run the server yourself, see below.
 
-**Not done** (details under [What I knowingly left out](#what-i-knowingly-left-out)): no automated tests for the Kotlin code (photo encoder, background sender) and no scripted device test; both were tested by hand on an emulator and a Pixel 6 Pro. iOS isn't built or run.
-
 Contents: [Running it](#running-it) · [Making it fail](#making-it-fail) · [Decisions, and why](#decisions-and-why) · [Judgement calls](#judgement-calls) · [What I'd do with another day](#what-id-do-with-another-day) · [What I knowingly left out](#what-i-knowingly-left-out)
 
 ---
