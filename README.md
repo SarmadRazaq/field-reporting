@@ -10,13 +10,23 @@ sim/      Runs the app's upload core in Node against the real server, through th
 
 Screen recording: _link to be added_
 
+**Hosted server:** `https://field-reports-server.fly.dev` (admin page at [`/admin`](https://field-reports-server.fly.dev/admin)). It's the same server as in `server/`, running on Fly.io, so you can test without setting up a backend. The admin page and the failure controls need the admin token, which is sent with the submission rather than kept in this public repo. You can also run the server yourself, see below.
+
+**Not done** (details under [What I knowingly left out](#what-i-knowingly-left-out)): no automated tests for the Kotlin code (photo encoder, background sender), which was tested on the Android emulator only, not on a physical phone; iOS isn't built or run.
+
+Contents: [Running it](#running-it) · [Making it fail](#making-it-fail) · [Decisions, and why](#decisions-and-why) · [Judgement calls](#judgement-calls) · [What I'd do with another day](#what-id-do-with-another-day) · [What I knowingly left out](#what-i-knowingly-left-out)
+
 ---
 
 ## Running it
 
 ### 1. Server
 
-Needs Node 20+.
+There are two ways: use the hosted one, or run your own.
+
+**Hosted.** `https://field-reports-server.fly.dev` is already running. Nothing to set up; skip to the app.
+
+**Locally.** Needs Node 20+.
 
 ```sh
 cd server
@@ -24,7 +34,26 @@ npm install
 npm start            # http://localhost:4000, admin page at http://localhost:4000/admin
 ```
 
-`PORT` and `DATA_DIR` (default `./data`) can be set in the environment. Uploaded images and the SQLite file live in `DATA_DIR`; delete the folder to start the server empty.
+Environment variables:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `PORT` | `4000` | Port to listen on. |
+| `DATA_DIR` | `./data` | Where the SQLite file and uploaded images live. Delete the folder to start the server empty. |
+| `ADMIN_TOKEN` | not set | If set, `/admin` and the failure controls require it: as the password in the browser (any username), or as a `Bearer` token from the CLI. Not needed locally. The upload API under `/v1` stays open either way, since the app has no credentials to send. |
+
+**Deploying your own copy to Fly.io.** `server/` has a `Dockerfile` and `fly.toml`: one machine that never stops (the failure settings live in memory, and an upload on 2G runs for minutes) and a volume at `/data` for SQLite and the photos. With [`flyctl`](https://fly.io/docs/flyctl/install/) installed:
+
+```sh
+cd server
+fly auth login
+fly apps create <your-app-name>          # and set the same name in fly.toml
+fly volumes create field_reports_data --region fra --size 1
+fly secrets set ADMIN_TOKEN=<a-long-random-string>
+fly deploy --ha=false                    # one machine: a second would have its own SQLite file
+```
+
+Any Docker host with a persistent disk works the same way. Serverless platforms don't: the failure settings would reset between requests, and long chunk uploads get cut off.
 
 ### 2. App (Android)
 
@@ -36,15 +65,22 @@ npm install
 npx react-native run-android
 ```
 
-**Pointing the app at the server.** The default is `http://10.0.2.2:4000`, which is the host machine as seen from the Android emulator. A physical phone on the same Wi-Fi uses the computer's LAN address. Set it in the app under **Settings → Connection** and tap **Save and check**.
+That's a debug build: it loads its JavaScript from Metro on your computer, so it can't start while the phone is in airplane mode. **For anything offline, use a release build**, which carries its JavaScript inside the APK (signed with the debug key, so it installs over the debug build and keeps its data):
+
+```sh
+cd app
+npx react-native run-android --mode release
+```
+
+**Pointing the app at the server.** The default is `http://10.0.2.2:4000`, which is the host machine as seen from the Android emulator. For the hosted server, use `https://field-reports-server.fly.dev`. A physical phone on the same Wi-Fi as a local server uses the computer's LAN address. Set it in the app under **Settings → Connection** and tap **Save and check**.
 
 Don't use `adb reverse` for testing. It tunnels over USB, so airplane mode no longer cuts the app off from the server, and that's the very thing being tested.
 
 ### 3. Tests
 
 ```sh
-cd app && npm test       # 52 tests: the upload engine with fake network, disk and clock; stored-data upgrades; the failure screens
-cd server && npm test    # 14 tests: the upload protocol and the failure injection
+cd app && npm test       # 59 tests: the upload engine with fake network, disk and clock; the background hand-off; stored-data upgrades; the failure screens
+cd server && npm test    # 17 tests: the upload protocol, the failure injection and the admin token
 ```
 
 ### 4. The main scenario, without a phone
@@ -57,13 +93,21 @@ npm install
 npm run sim              # server must be running on :4000
 ```
 
+Against the hosted server (PowerShell; in bash, put the variables before the command):
+
+```powershell
+$env:SERVER="https://field-reports-server.fly.dev"; $env:ADMIN_TOKEN="<token>"; $env:NODE_OPTIONS="--dns-result-order=ipv4first"; npm run sim
+```
+
+`NODE_OPTIONS` makes Node try IPv4 first, for networks without IPv6.
+
 It starts in "airplane mode", composes three reports (one with five ~6000×4500 camera-style originals), force-quits, reopens on a throttled flaky link, drops the connection twice mid-upload, loses one commit reply and force-quits again. Then it checks that the server holds all three reports exactly once, with every image intact and under 5 MB. `BANDWIDTH` (bytes/s, default 150,000) sets the throttle; real 2G at ~6 KB/s works too, it just takes an hour.
 
 ---
 
 ## Making it fail
 
-Failures are injected by the server, switchable at runtime without a restart. Use the admin page at `/admin`, or the CLI:
+The brief asks for a backend that can fail on demand: latency, dropped connections, refused uploads, requests that never answer. This server does all of that per route, switchable at runtime without a restart. Use the admin page at `/admin`, or the CLI:
 
 ```sh
 cd server
@@ -95,7 +139,25 @@ npm run chaos -- rule manifest refuse --status 413
 npm run chaos -- rule chunk hang --times 1
 ```
 
-Routes are `manifest`, `chunk`, `commit` or `any`. `SERVER=http://host:4000` points the CLI at another machine.
+Routes are `manifest`, `chunk`, `commit` or `any`. `SERVER=http://host:4000` points the CLI at another machine. For the hosted server, set both `SERVER` and the token:
+
+```powershell
+$env:SERVER="https://field-reports-server.fly.dev"; $env:ADMIN_TOKEN="<token>"; npm run chaos -- preset flaky
+```
+
+On the hosted server, Fly's proxy sits between the phone and the server. An injected "hang" or "drop mid-body" may reach the phone as a timeout or a 502 rather than a raw dropped connection. The app retries both the same way.
+
+### The main scenario on a phone
+
+With the server running and a release build installed:
+
+1. Turn on airplane mode. Compose three reports, one with five photos from the camera. Each says "Saved on this phone".
+2. Force-quit the app (swipe it away, or `adb shell am force-stop com.fieldreports`). Reopen it: all three are still there.
+3. On the server, `npm run chaos -- preset 2g` (or `bandwidth 60000` and `latency 300` for a faster run). Turn airplane mode off.
+4. While a photo is uploading, turn airplane mode on and off again, twice. Leave the app in the background too if you like: the notification shows progress.
+5. Open `/admin` on the server: three reports, each committed once, every photo under 5 MB with its size and dimensions shown. The app's **Sent** tab shows the same list, fetched from the server.
+
+No input is needed after step 3 beyond toggling the network.
 
 ---
 
@@ -134,6 +196,8 @@ Every failure is sorted into one of three kinds (`app/src/core/retry.ts`):
 | Retry on our own | no connection, timeouts, 408, 423/425, 429, 5xx | Exponential backoff with jitter: 2 s, 4 s, 8 s … up to 60 s. Up to 5 min while the phone says it's offline. `Retry-After` is honoured. |
 | Stop and ask | 400, 401/403, 409, 413, 422, a photo that can't be read or shrunk | "Needs attention" with the reason, and Retry / Discard buttons. When the refusal names one photo, a **Replace photo** button swaps just that one and keeps the rest. Retrying the same bytes would get the same answer. |
 | Start over | 404 | The server no longer knows the report; send the manifest again. |
+
+After a failure nothing else is tried until its wait is over, since a failure usually means the link is down for every report; then the oldest report goes first again. The native background sender follows the same table and timings.
 
 The phone's "offline" signal never stops an attempt, because on 2G it's wrong in both directions. "Back online" is used only as a reason to stop waiting out a backoff. Every request has a timeout (30 s for control requests, 60 s per chunk), so a server that never answers can't hang the queue.
 
@@ -234,16 +298,36 @@ The screens get the outbox from an `OutboxProvider` (`ui/hooks/useOutbox.ts`), n
 
 ---
 
+## Judgement calls
+
+Where the brief left room, this is what I decided:
+
+| Question | Decision | Why |
+|---|---|---|
+| What is "5 MB"? | 5,000,000 bytes, aiming for 4.8 MB | The strict reading is also below 5 MiB, so it's safe under either meaning. |
+| How small may a photo get? | 4096 px first, never below 1600 px | "Still worth looking at" means a serial plate or a crack stays readable; on 2G time is cheaper than detail. |
+| Location and EXIF data | Stripped | Privacy by default. If location matters, it should be a field the inspector sees. |
+| When to give up retrying | Never, for network and server errors; at once for refusals | Giving up on 2G loses reports. A server that keeps failing is called out after 30 minutes instead. |
+| Gallery permission | None needed (system photo picker) | Nothing to refuse, and nothing to break. The camera permission is handled, including a grant made later in Settings. |
+| What Start over deletes | Everything on the phone; the server's reports only if asked | Deleting other people's data should be a separate, deliberate choice. A commit already sent is waited for, so the app can say where that report ended up. |
+| Who decides the order | Oldest first, with "Send this one first" | Predictable; automatic smallest-first could keep a big report waiting forever. |
+| Backend | My own Express server, also hosted on Fly.io | Full control over failure injection per route, including "commit, then lose the reply". Hosted on one always-on machine with a disk, since the failure settings live in memory and SQLite needs a persistent file. |
+
+---
+
 ## What I'd do with another day
 
 - An end-to-end test on a real device that scripts airplane mode and force-quits (e.g. Maestro).
+- Tests for the Kotlin background sender against the server's failure injection, and one protocol description both clients are checked against.
+- Try it on phones with aggressive battery managers (Samsung, Xiaomi), which can stop background work beyond what stock Android does.
 - Show thumbnails in the Sent tab progressively on 2G, with an offline image cache.
 
 ## What I knowingly left out
 
 - **iOS.** The project is there, but I haven't built or run it. The photo encoder and background sending are Android only, so it would not work there as it stands.
+- **Only tested on the emulator.** Everything above ran on an Android 17 emulator (Pixel 7 Pro), not a physical phone, and not on Android 12 or older.
 - **No automated tests for the native code.** The photo encoder and the background sender were tested on the emulator; the logic around them (hand-off, applying results) is covered by the Jest tests, but the Kotlin itself is not.
 - **The background sender is a second copy of the protocol.** Kotlin mirrors `core/deliver.ts`; a protocol change has to be made in both.
 - **Dark mode.** The app is light-only by design (see Interface).
-- **The server is a test backend.** No authentication (out of scope by the brief) and no horizontal scaling.
+- **The server is a test backend.** The upload API has no authentication (out of scope by the brief): anyone with the URL can send reports or use the "delete every report" call behind Start over's "for everyone" switch. Only the admin page and failure controls are behind a token. It runs on one machine with no horizontal scaling.
 - **Editing a report after it's sent**, login, push notifications, maps and video are out of scope by the brief.
